@@ -1,4 +1,4 @@
-use crate::{Bucket, Error, OramBlock, OramParams, OramState, PageStore, Result};
+use crate::{ct, Bucket, Error, OramBlock, OramParams, OramState, PageStore, Result};
 use rand::{CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -192,22 +192,23 @@ impl<S: PageStore> PathOram<S> {
         let path = self.params.path_nodes(old_leaf);
         self.read_path_into_stash(&path)?;
 
-        let mut found = false;
+        let mut found = 0u8;
         let mut output = vec![0u8; self.params.block_size];
-        let mut update = Some(update);
-        for block in &mut self.stash {
-            let matched = block.occupied && block.logical_id == logical_id;
-            if matched {
-                output.copy_from_slice(&block.payload);
-                if let Some(update_fn) = update.take() {
-                    update_fn(&mut block.payload);
-                }
-                block.leaf = new_leaf;
-                found = true;
-            }
+        for block in &self.stash {
+            let matched = block.logical_id_choice(logical_id);
+            ct::cmov_bytes(&mut output, &block.payload, matched);
+            found = ct::or(found, matched);
         }
-        if !found {
+        if found == 0 {
             return Err(Error::BlockNotFound(logical_id));
+        }
+
+        let mut new_payload = output.clone();
+        update(&mut new_payload);
+        for block in &mut self.stash {
+            let matched = block.logical_id_choice(logical_id);
+            ct::cmov_bytes(&mut block.payload, &new_payload, matched);
+            ct::cmov_u32(&mut block.leaf, new_leaf, matched);
         }
 
         self.write_path_from_stash(&path)?;
@@ -234,12 +235,24 @@ impl<S: PageStore> PathOram<S> {
         for (depth, node_idx) in path_by_depth {
             let mut bucket = Bucket::dummy(self.params.bucket_size, self.params.block_size);
             for slot in &mut bucket.blocks {
-                if let Some(stash_idx) = self.find_flushable(depth, node_idx) {
-                    *slot = std::mem::replace(
-                        &mut self.stash[stash_idx],
-                        OramBlock::dummy(self.params.block_size),
+                let mut selected = OramBlock::dummy(self.params.block_size);
+                let mut filled = 0u8;
+                for stash_slot in &mut self.stash {
+                    let occupied = ct::choice_from_bool(stash_slot.occupied);
+                    let can_place = ct::and(
+                        ct::and(occupied, ct::not(filled)),
+                        Self::node_contains_leaf_choice(
+                            &self.params,
+                            depth,
+                            node_idx,
+                            stash_slot.leaf,
+                        ),
                     );
+                    selected.cmov_from(stash_slot, can_place);
+                    stash_slot.clear_if(can_place, self.params.block_size);
+                    filled = ct::or(filled, can_place);
                 }
+                *slot = selected;
             }
             let encoded = bucket.encode(self.params.bucket_size, self.params.block_size)?;
             self.store.write_page(node_idx, &encoded)?;
@@ -247,19 +260,14 @@ impl<S: PageStore> PathOram<S> {
         Ok(())
     }
 
-    fn find_flushable(&self, depth: usize, node_idx: usize) -> Option<usize> {
-        // Fixed-shape implementation: scan every stash slot and select the
-        // first flushable slot. This still needs a later CMOV audit, but it no
-        // longer changes Vec length or exits early based on secret state.
-        let mut candidate = None;
-        for (i, block) in self.stash.iter().enumerate() {
-            let can_place =
-                block.occupied && self.params.node_contains_leaf(depth, node_idx, block.leaf);
-            if can_place && candidate.is_none() {
-                candidate = Some(i);
-            }
-        }
-        candidate
+    fn node_contains_leaf_choice(
+        params: &OramParams,
+        depth: usize,
+        node_idx: usize,
+        leaf: u32,
+    ) -> ct::Choice {
+        let safe_leaf = ((leaf as usize) & (params.leaves - 1)) as u32;
+        ct::eq_usize(params.node_index(depth, safe_leaf), node_idx)
     }
 
     fn greedy_flush_all(&mut self) -> Result<()> {
@@ -296,18 +304,18 @@ impl<S: PageStore> PathOram<S> {
     }
 
     fn insert_into_stash(&mut self, block: OramBlock) -> Result<()> {
-        if !block.occupied {
-            return Ok(());
-        }
-
-        let mut pending = Some(block);
+        let block_occupied = ct::choice_from_bool(block.occupied);
+        let mut inserted = ct::not(block_occupied);
         for slot in &mut self.stash {
-            if pending.is_some() && !slot.occupied {
-                *slot = pending.take().expect("pending block present");
-            }
+            let can_insert = ct::and(
+                ct::and(block_occupied, ct::not(inserted)),
+                ct::not(ct::choice_from_bool(slot.occupied)),
+            );
+            slot.cmov_from(&block, can_insert);
+            inserted = ct::or(inserted, can_insert);
         }
 
-        if pending.is_some() {
+        if inserted == 0 {
             return Err(Error::StashOverflow {
                 len: self.params.stash_capacity + 1,
                 capacity: self.params.stash_capacity,

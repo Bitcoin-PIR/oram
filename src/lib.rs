@@ -7,6 +7,7 @@
 
 pub mod aead;
 pub mod block;
+pub mod ct;
 pub mod error;
 pub mod oram;
 pub mod params;

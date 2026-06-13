@@ -21,6 +21,8 @@ Implemented:
   ChaCha20-Poly1305 state-file encryption.
 - Fixed-prefix front cache (`FrontCachedPageStore`) for keeping public top ORAM
   tree levels in trusted memory.
+- Mask-based CMOV-style helpers for stash lookup, stash insert, and path
+  eviction selection.
 - `oramctl` CLI for building deterministic test images and running random-read
   benchmarks.
 - Fixed trace-shape tests: each logical access reads and rewrites a complete
@@ -31,8 +33,8 @@ Intentionally not implemented yet:
 - Recursive position map.
 - Oblivious bulk initialization.
 - Crash-safe checkpointing or WAL.
-- Constant-time / CMOV hardening of the stash and eviction loops.
-- SEV-SNP ciphertext-channel audit.
+- Release assembly / SEV-SNP ciphertext-channel audit of the constant-shape hot
+  loops.
 - Multi-client sharding.
 
 ## Design
@@ -103,10 +105,11 @@ memory. Use `0` to disable this wrapper.
 ## Prototype Warning
 
 This is a correctness and storage-shape prototype. Before production use inside
-SEV-SNP, the hot loops need explicit constant-time hardening and assembly/trace
-inspection. The stash is now fixed-capacity and path eviction scans every slot,
-but the selection logic still uses ordinary Rust bool/`Option` control flow
-rather than audited CMOV-only primitives.
+SEV-SNP, the hot loops still need release assembly and trace inspection on the
+target build. The stash is fixed-capacity, and online stash lookup, stash insert,
+and path eviction selection now use full-slot scans plus mask-based CMOV-style
+helpers. That is an implementation hardening step, not a formal constant-time
+guarantee from Rust or LLVM.
 
 The `.state` file contains the position map, stash, and RNG state. It is trusted
 controller state. Do not write it to untrusted storage in plaintext in a real
