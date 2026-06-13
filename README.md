@@ -16,7 +16,10 @@ Implemented:
 - `MemPageStore` for tests.
 - `FilePageStore` for NVMe/page-file backed storage.
 - `AeadPageStore` wrapper using ChaCha20-Poly1305 per page.
-- Trusted controller-state checkpoint/reopen (`OramState`).
+- Trusted controller-state checkpoint/reopen (`OramState`), with optional
+  ChaCha20-Poly1305 state-file encryption.
+- Fixed-prefix front cache (`FrontCachedPageStore`) for keeping public top ORAM
+  tree levels in trusted memory.
 - `oramctl` CLI for building deterministic test images and running random-read
   benchmarks.
 - Fixed trace-shape tests: each logical access reads and rewrites a complete
@@ -67,14 +70,17 @@ Build an encrypted test image:
 
 ```bash
 KEY_HEX=4242424242424242424242424242424242424242424242424242424242424242
+STATE_KEY_HEX=7373737373737373737373737373737373737373737373737373737373737373
 
 cargo run --bin oramctl -- build \
   --image /tmp/bpir-oram.pages \
   --state /tmp/bpir-oram.state \
+  --state-key-hex "$STATE_KEY_HEX" \
   --blocks 1024 \
   --block-size 64 \
   --encrypted \
-  --key-hex "$KEY_HEX"
+  --key-hex "$KEY_HEX" \
+  --cache-levels 4
 ```
 
 Run random reads against it:
@@ -83,10 +89,15 @@ Run random reads against it:
 cargo run --bin oramctl -- bench \
   --image /tmp/bpir-oram.pages \
   --state /tmp/bpir-oram.state \
+  --state-key-hex "$STATE_KEY_HEX" \
   --ops 1000 \
   --encrypted \
-  --key-hex "$KEY_HEX"
+  --key-hex "$KEY_HEX" \
+  --cache-levels 4
 ```
+
+`--cache-levels 4` caches `(1 << 4) - 1 = 15` public top-tree pages in trusted
+memory. Use `0` to disable this wrapper.
 
 ## Prototype Warning
 
@@ -97,4 +108,5 @@ still uses ordinary Rust branch/`Option` selection.
 
 The `.state` file contains the position map, stash, and RNG state. It is trusted
 controller state. Do not write it to untrusted storage in plaintext in a real
-deployment; it needs SEV-sealed storage or an AEAD wrapper before production use.
+deployment. Use `--state-key-hex` for prototype AEAD protection; production
+should replace that key path with SEV-sealed storage.

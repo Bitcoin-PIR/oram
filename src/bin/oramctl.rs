@@ -1,6 +1,6 @@
 use bitcoinpir_oram::{
-    AeadPageStore, Error, FilePageStore, OramParams, OramState, PageStore, PathOram, Result,
-    AEAD_OVERHEAD,
+    AeadPageStore, Error, FilePageStore, FrontCachedPageStore, OramParams, OramState, PageStore,
+    PathOram, Result, AEAD_OVERHEAD,
 };
 use clap::{Parser, Subcommand};
 use rand::{RngCore, SeedableRng};
@@ -27,6 +27,9 @@ enum Command {
         /// Trusted controller-state output path.
         #[arg(long)]
         state: PathBuf,
+        /// 32-byte hex state encryption key. If omitted, state is written in plaintext.
+        #[arg(long)]
+        state_key_hex: Option<String>,
         /// Number of logical blocks.
         #[arg(long)]
         blocks: usize,
@@ -48,6 +51,9 @@ enum Command {
         /// 32-byte hex page encryption key. Required with --encrypted.
         #[arg(long)]
         key_hex: Option<String>,
+        /// Cache this many public top ORAM tree levels in trusted memory.
+        #[arg(long, default_value_t = 0)]
+        cache_levels: usize,
         /// 32-byte hex RNG seed. Defaults to all 0x07 for reproducible tests.
         #[arg(long)]
         seed_hex: Option<String>,
@@ -60,6 +66,9 @@ enum Command {
         /// Trusted controller-state path.
         #[arg(long)]
         state: PathBuf,
+        /// 32-byte hex state encryption key. Required if the state was encrypted.
+        #[arg(long)]
+        state_key_hex: Option<String>,
         /// Number of random reads.
         #[arg(long, default_value_t = 1000)]
         ops: usize,
@@ -69,6 +78,9 @@ enum Command {
         /// 32-byte hex page encryption key. Required with --encrypted.
         #[arg(long)]
         key_hex: Option<String>,
+        /// Cache this many public top ORAM tree levels in trusted memory.
+        #[arg(long, default_value_t = 0)]
+        cache_levels: usize,
         /// 32-byte hex query RNG seed. Defaults to all 0x03.
         #[arg(long)]
         query_seed_hex: Option<String>,
@@ -84,6 +96,7 @@ fn main() -> Result<()> {
         Command::Build {
             image,
             state,
+            state_key_hex,
             blocks,
             block_size,
             leaves,
@@ -91,6 +104,7 @@ fn main() -> Result<()> {
             stash_capacity,
             encrypted,
             key_hex,
+            cache_levels,
             seed_hex,
         } => {
             if block_size < 8 {
@@ -105,13 +119,21 @@ fn main() -> Result<()> {
             .with_bucket_size(bucket_size)?
             .with_stash_capacity(stash_capacity)?;
             let seed = parse_seed(seed_hex.as_deref(), 0x07)?;
-            let store = open_file_store(&image, &params, encrypted, key_hex.as_deref())?;
+            let cached_pages = cached_pages_for_levels(&params, cache_levels)?;
+            let store = open_file_store(
+                &image,
+                &params,
+                encrypted,
+                key_hex.as_deref(),
+                cached_pages,
+                false,
+            )?;
             let payloads = deterministic_payloads(blocks, block_size);
 
             let started = Instant::now();
             let mut oram = PathOram::build_trusted(params.clone(), store, payloads, seed)?;
             oram.flush()?;
-            oram.snapshot().save_atomic(&state)?;
+            save_state(&oram.snapshot(), &state, state_key_hex.as_deref())?;
             let elapsed = started.elapsed();
 
             println!("built=true");
@@ -124,26 +146,38 @@ fn main() -> Result<()> {
             println!("tree_height={}", params.height());
             println!("bucket_pages={}", params.bucket_count());
             println!("plaintext_page_bytes={}", params.bucket_bytes());
+            println!("cached_pages={cached_pages}");
             println!("stash_len={}", oram.stash_len());
+            println!("state_encrypted={}", state_key_hex.is_some());
             println!("elapsed_ms={}", elapsed.as_millis());
         }
         Command::Bench {
             image,
             state,
+            state_key_hex,
             ops,
             encrypted,
             key_hex,
+            cache_levels,
             query_seed_hex,
             no_save,
         } => {
-            let loaded = OramState::load(&state)?;
+            let loaded = load_state(&state, state_key_hex.as_deref())?;
             let params = loaded.params.clone();
             if params.block_size < 8 {
                 return Err(Error::InvalidInput(
                     "state block_size must be at least 8 for benchmark checksum".into(),
                 ));
             }
-            let store = open_file_store(&image, &params, encrypted, key_hex.as_deref())?;
+            let cached_pages = cached_pages_for_levels(&params, cache_levels)?;
+            let store = open_file_store(
+                &image,
+                &params,
+                encrypted,
+                key_hex.as_deref(),
+                cached_pages,
+                true,
+            )?;
             let mut oram = PathOram::from_state(store, loaded)?;
             let query_seed = parse_seed(query_seed_hex.as_deref(), 0x03)?;
             let mut query_rng = ChaCha20Rng::from_seed(query_seed);
@@ -158,14 +192,16 @@ fn main() -> Result<()> {
             let elapsed = started.elapsed();
             oram.flush()?;
             if !no_save {
-                oram.snapshot().save_atomic(&state)?;
+                save_state(&oram.snapshot(), &state, state_key_hex.as_deref())?;
             }
 
             println!("bench=true");
             println!("ops={ops}");
             println!("logical_blocks={}", params.logical_blocks);
             println!("tree_height={}", params.height());
+            println!("cached_pages={cached_pages}");
             println!("stash_len={}", oram.stash_len());
+            println!("state_encrypted={}", state_key_hex.is_some());
             println!("elapsed_ms={}", elapsed.as_millis());
             println!(
                 "avg_us={:.3}",
@@ -177,31 +213,68 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn load_state(path: &Path, state_key_hex: Option<&str>) -> Result<OramState> {
+    match state_key_hex {
+        Some(key_hex) => OramState::load_encrypted(path, parse_32_hex(key_hex)?),
+        None => OramState::load(path),
+    }
+}
+
+fn save_state(state: &OramState, path: &Path, state_key_hex: Option<&str>) -> Result<()> {
+    match state_key_hex {
+        Some(key_hex) => state.save_encrypted_atomic(path, parse_32_hex(key_hex)?),
+        None => state.save_atomic(path),
+    }
+}
+
 fn open_file_store(
     image: &Path,
     params: &OramParams,
     encrypted: bool,
     key_hex: Option<&str>,
+    cached_pages: usize,
+    load_cached_pages: bool,
 ) -> Result<Box<dyn PageStore>> {
-    if encrypted {
+    let store: Box<dyn PageStore> = if encrypted {
         let key = parse_required_key(key_hex)?;
         let file = FilePageStore::open(
             image,
             params.bucket_count(),
             params.bucket_bytes() + AEAD_OVERHEAD,
         )?;
-        Ok(Box::new(AeadPageStore::new(
-            file,
-            key,
-            params.bucket_bytes(),
-        )?))
+        Box::new(AeadPageStore::new(file, key, params.bucket_bytes())?)
     } else {
-        Ok(Box::new(FilePageStore::open(
+        Box::new(FilePageStore::open(
             image,
             params.bucket_count(),
             params.bucket_bytes(),
+        )?)
+    };
+
+    if cached_pages == 0 {
+        Ok(store)
+    } else if load_cached_pages {
+        Ok(Box::new(FrontCachedPageStore::new(store, cached_pages)?))
+    } else {
+        Ok(Box::new(FrontCachedPageStore::new_zeroed(
+            store,
+            cached_pages,
         )?))
     }
+}
+
+fn cached_pages_for_levels(params: &OramParams, cache_levels: usize) -> Result<usize> {
+    if cache_levels == 0 {
+        return Ok(0);
+    }
+    if cache_levels > params.height() {
+        return Err(Error::InvalidInput(format!(
+            "cache-levels {} > tree height {}",
+            cache_levels,
+            params.height()
+        )));
+    }
+    Ok((1usize << cache_levels) - 1)
 }
 
 fn parse_seed(seed_hex: Option<&str>, default_byte: u8) -> Result<[u8; 32]> {
