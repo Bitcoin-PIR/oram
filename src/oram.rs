@@ -61,6 +61,7 @@ impl<S: PageStore> PathOram<S> {
             rng,
         };
         oram.greedy_flush_all()?;
+        oram.pad_stash();
         oram.check_stash()?;
         Ok(oram)
     }
@@ -89,13 +90,14 @@ impl<S: PageStore> PathOram<S> {
                 return Err(Error::InvalidInput(format!("leaf {leaf} out of range")));
             }
         }
-        let oram = Self {
+        let mut oram = Self {
             params,
             store,
             pos_map,
             stash,
             rng: ChaCha20Rng::from_seed(seed),
         };
+        oram.pad_stash();
         oram.check_stash()?;
         Ok(oram)
     }
@@ -115,13 +117,14 @@ impl<S: PageStore> PathOram<S> {
                 return Err(Error::InvalidInput(format!("leaf {leaf} out of range")));
             }
         }
-        let oram = Self {
+        let mut oram = Self {
             params: state.params,
             store,
             pos_map: state.pos_map,
             stash: state.stash,
             rng: state.rng,
         };
+        oram.pad_stash();
         oram.check_stash()?;
         Ok(oram)
     }
@@ -143,7 +146,7 @@ impl<S: PageStore> PathOram<S> {
 
     /// Current stash length.
     pub fn stash_len(&self) -> usize {
-        self.stash.len()
+        self.occupied_stash_len()
     }
 
     /// Borrow the current position map.
@@ -217,8 +220,9 @@ impl<S: PageStore> PathOram<S> {
         for &node in path {
             self.store.read_page(node, &mut buf)?;
             let bucket = Bucket::decode(&buf, self.params.bucket_size, self.params.block_size)?;
-            self.stash
-                .extend(bucket.blocks.into_iter().filter(|block| block.occupied));
+            for block in bucket.blocks {
+                self.insert_into_stash(block)?;
+            }
         }
         Ok(())
     }
@@ -231,7 +235,10 @@ impl<S: PageStore> PathOram<S> {
             let mut bucket = Bucket::dummy(self.params.bucket_size, self.params.block_size);
             for slot in &mut bucket.blocks {
                 if let Some(stash_idx) = self.find_flushable(depth, node_idx) {
-                    *slot = self.stash.swap_remove(stash_idx);
+                    *slot = std::mem::replace(
+                        &mut self.stash[stash_idx],
+                        OramBlock::dummy(self.params.block_size),
+                    );
                 }
             }
             let encoded = bucket.encode(self.params.bucket_size, self.params.block_size)?;
@@ -241,9 +248,9 @@ impl<S: PageStore> PathOram<S> {
     }
 
     fn find_flushable(&self, depth: usize, node_idx: usize) -> Option<usize> {
-        // V0 correctness implementation. This scans all stash entries and does
-        // not early-stop on match selection; later hardening should replace the
-        // final Option assignment with explicit CMOV discipline.
+        // Fixed-shape implementation: scan every stash slot and select the
+        // first flushable slot. This still needs a later CMOV audit, but it no
+        // longer changes Vec length or exits early based on secret state.
         let mut candidate = None;
         for (i, block) in self.stash.iter().enumerate() {
             let can_place =
@@ -288,12 +295,54 @@ impl<S: PageStore> PathOram<S> {
         Ok(())
     }
 
-    fn check_stash(&self) -> Result<()> {
-        if self.stash.len() > self.params.stash_capacity {
+    fn insert_into_stash(&mut self, block: OramBlock) -> Result<()> {
+        if !block.occupied {
+            return Ok(());
+        }
+
+        let mut pending = Some(block);
+        for slot in &mut self.stash {
+            if pending.is_some() && !slot.occupied {
+                *slot = pending.take().expect("pending block present");
+            }
+        }
+
+        if pending.is_some() {
             return Err(Error::StashOverflow {
-                len: self.stash.len(),
+                len: self.params.stash_capacity + 1,
                 capacity: self.params.stash_capacity,
             });
+        }
+        Ok(())
+    }
+
+    fn pad_stash(&mut self) {
+        if self.stash.len() > self.params.stash_capacity {
+            return;
+        }
+        self.stash.resize_with(self.params.stash_capacity, || {
+            OramBlock::dummy(self.params.block_size)
+        });
+    }
+
+    fn occupied_stash_len(&self) -> usize {
+        self.stash.iter().filter(|block| block.occupied).count()
+    }
+
+    fn check_stash(&self) -> Result<()> {
+        let occupied = self.occupied_stash_len();
+        if occupied > self.params.stash_capacity {
+            return Err(Error::StashOverflow {
+                len: occupied,
+                capacity: self.params.stash_capacity,
+            });
+        }
+        if self.stash.len() != self.params.stash_capacity {
+            return Err(Error::InvalidInput(format!(
+                "stash slots {} != stash_capacity {}",
+                self.stash.len(),
+                self.params.stash_capacity
+            )));
         }
         Ok(())
     }
@@ -461,5 +510,25 @@ mod tests {
 
         assert_eq!(&reopened.read(3).unwrap()[..8], &3u64.to_le_bytes());
         assert_eq!(&reopened.read(29).unwrap()[..8], &29u64.to_le_bytes());
+    }
+
+    #[test]
+    fn stash_uses_fixed_capacity_slots() {
+        let params = OramParams::with_leaves(64, 16, 64)
+            .unwrap()
+            .with_stash_capacity(256)
+            .unwrap();
+        let store = MemPageStore::new(params.bucket_count(), params.bucket_bytes()).unwrap();
+        let mut oram =
+            PathOram::build_trusted(params.clone(), store, blocks(64, 16), [19; 32]).unwrap();
+
+        assert_eq!(oram.stash().len(), params.stash_capacity);
+        assert_eq!(oram.stash_len(), 0);
+
+        for logical_id in [1u64, 2, 3, 4, 5, 1, 63, 0] {
+            let got = oram.read(logical_id).unwrap();
+            assert_eq!(&got[..8], &logical_id.to_le_bytes());
+            assert_eq!(oram.stash().len(), params.stash_capacity);
+        }
     }
 }

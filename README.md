@@ -12,6 +12,7 @@ accesses.
 Implemented:
 
 - Path ORAM controller with in-TEE position map and stash.
+- Fixed-capacity stash slots with full-slot scans for path read/write.
 - Trusted, non-oblivious bulk initialization for offline image creation.
 - `MemPageStore` for tests.
 - `FilePageStore` for NVMe/page-file backed storage.
@@ -103,8 +104,9 @@ memory. Use `0` to disable this wrapper.
 
 This is a correctness and storage-shape prototype. Before production use inside
 SEV-SNP, the hot loops need explicit constant-time hardening and assembly/trace
-inspection. In particular, `find_flushable` currently scans the whole stash but
-still uses ordinary Rust branch/`Option` selection.
+inspection. The stash is now fixed-capacity and path eviction scans every slot,
+but the selection logic still uses ordinary Rust bool/`Option` control flow
+rather than audited CMOV-only primitives.
 
 The `.state` file contains the position map, stash, and RNG state. It is trusted
 controller state. Do not write it to untrusted storage in plaintext in a real
