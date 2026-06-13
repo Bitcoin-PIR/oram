@@ -19,6 +19,33 @@ pub trait PageStore {
 
     /// Write a page from `input`.
     fn write_page(&mut self, page_idx: usize, input: &[u8]) -> Result<()>;
+
+    /// Flush durable storage. In-memory implementations may no-op.
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<T: PageStore + ?Sized> PageStore for Box<T> {
+    fn page_size(&self) -> usize {
+        (**self).page_size()
+    }
+
+    fn page_count(&self) -> usize {
+        (**self).page_count()
+    }
+
+    fn read_page(&mut self, page_idx: usize, out: &mut [u8]) -> Result<()> {
+        (**self).read_page(page_idx, out)
+    }
+
+    fn write_page(&mut self, page_idx: usize, input: &[u8]) -> Result<()> {
+        (**self).write_page(page_idx, input)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        (**self).flush()
+    }
 }
 
 /// In-memory page store for tests and microbenchmarks.
@@ -133,6 +160,11 @@ impl PageStore for FilePageStore {
         self.file.write_all(input)?;
         Ok(())
     }
+
+    fn flush(&mut self) -> Result<()> {
+        self.file.sync_all()?;
+        Ok(())
+    }
 }
 
 /// A wrapper that records page access traces for tests.
@@ -188,6 +220,10 @@ impl<S: PageStore> PageStore for TracingStore<S> {
     fn write_page(&mut self, page_idx: usize, input: &[u8]) -> Result<()> {
         self.trace.borrow_mut().push(TraceEvent::Write(page_idx));
         self.inner.write_page(page_idx, input)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
     }
 }
 

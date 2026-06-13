@@ -10,6 +10,7 @@ pub mod block;
 pub mod error;
 pub mod oram;
 pub mod params;
+pub mod state;
 pub mod store;
 
 pub use aead::{AeadPageStore, AEAD_OVERHEAD};
@@ -17,4 +18,5 @@ pub use block::{Bucket, OramBlock};
 pub use error::{Error, Result};
 pub use oram::PathOram;
 pub use params::OramParams;
+pub use state::OramState;
 pub use store::{FilePageStore, MemPageStore, PageStore, TracingStore};

@@ -31,6 +31,14 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    /// State serialization failed.
+    #[error(transparent)]
+    Bincode(#[from] bincode::Error),
+
+    /// Hex decoding failed.
+    #[error(transparent)]
+    Hex(#[from] hex::FromHexError),
+
     /// Page encryption or authentication failed.
     #[error("page authentication failed")]
     Aead,

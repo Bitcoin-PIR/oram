@@ -1,10 +1,11 @@
 use crate::{Error, Result};
+use serde::{Deserialize, Serialize};
 
 const OCCUPIED: u8 = 1;
 const EMPTY: u8 = 0;
 
 /// One fixed-size logical ORAM block.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OramBlock {
     /// Whether the slot contains a real logical block.
     pub occupied: bool,
@@ -107,7 +108,7 @@ impl OramBlock {
 }
 
 /// A physical Path ORAM bucket.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Bucket {
     /// Fixed number of physical block slots.
     pub blocks: Vec<OramBlock>,

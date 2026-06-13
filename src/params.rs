@@ -1,7 +1,8 @@
 use crate::{Error, Result};
+use serde::{Deserialize, Serialize};
 
 /// Public ORAM sizing parameters.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OramParams {
     /// Number of logical blocks addressed by callers.
     pub logical_blocks: usize,

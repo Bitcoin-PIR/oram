@@ -1,4 +1,4 @@
-use crate::{Bucket, Error, OramBlock, OramParams, PageStore, Result};
+use crate::{Bucket, Error, OramBlock, OramParams, OramState, PageStore, Result};
 use rand::{CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -100,6 +100,42 @@ impl<S: PageStore> PathOram<S> {
         Ok(oram)
     }
 
+    /// Re-open an ORAM from a trusted controller state.
+    pub fn from_state(store: S, state: OramState) -> Result<Self> {
+        validate_store(&state.params, &store)?;
+        if state.pos_map.len() != state.params.logical_blocks {
+            return Err(Error::InvalidInput(format!(
+                "pos_map len {} != logical_blocks {}",
+                state.pos_map.len(),
+                state.params.logical_blocks
+            )));
+        }
+        for &leaf in &state.pos_map {
+            if leaf as usize >= state.params.leaves {
+                return Err(Error::InvalidInput(format!("leaf {leaf} out of range")));
+            }
+        }
+        let oram = Self {
+            params: state.params,
+            store,
+            pos_map: state.pos_map,
+            stash: state.stash,
+            rng: state.rng,
+        };
+        oram.check_stash()?;
+        Ok(oram)
+    }
+
+    /// Snapshot the trusted controller state.
+    pub fn snapshot(&self) -> OramState {
+        OramState::new(
+            self.params.clone(),
+            self.pos_map.clone(),
+            self.stash.clone(),
+            self.rng.clone(),
+        )
+    }
+
     /// Immutable view of public parameters.
     pub fn params(&self) -> &OramParams {
         &self.params
@@ -123,6 +159,11 @@ impl<S: PageStore> PathOram<S> {
     /// Consume the controller and return its storage.
     pub fn into_store(self) -> S {
         self.store
+    }
+
+    /// Flush the underlying storage.
+    pub fn flush(&mut self) -> Result<()> {
+        self.store.flush()
     }
 
     /// Read a logical block.
@@ -400,5 +441,25 @@ mod tests {
 
         let got = oram.read(12).unwrap();
         assert_eq!(&got[..8], &12u64.to_le_bytes());
+    }
+
+    #[test]
+    fn state_roundtrip_reopens_controller() {
+        let params = OramParams::with_leaves(32, 16, 32).unwrap();
+        let store = MemPageStore::new(params.bucket_count(), params.bucket_bytes()).unwrap();
+        let mut oram =
+            PathOram::build_trusted(params.clone(), store, blocks(32, 16), [17; 32]).unwrap();
+        assert_eq!(&oram.read(3).unwrap()[..8], &3u64.to_le_bytes());
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("controller.state");
+        let snapshot = oram.snapshot();
+        snapshot.save_atomic(&state_path).unwrap();
+        let state = OramState::load(&state_path).unwrap();
+        let store = oram.into_store();
+        let mut reopened = PathOram::from_state(store, state).unwrap();
+
+        assert_eq!(&reopened.read(3).unwrap()[..8], &3u64.to_le_bytes());
+        assert_eq!(&reopened.read(29).unwrap()[..8], &29u64.to_le_bytes());
     }
 }

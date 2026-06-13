@@ -112,4 +112,8 @@ impl<S: PageStore> PageStore for AeadPageStore<S> {
         sealed.zeroize();
         Ok(())
     }
+
+    fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
+    }
 }

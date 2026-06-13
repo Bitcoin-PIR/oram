@@ -16,6 +16,9 @@ Implemented:
 - `MemPageStore` for tests.
 - `FilePageStore` for NVMe/page-file backed storage.
 - `AeadPageStore` wrapper using ChaCha20-Poly1305 per page.
+- Trusted controller-state checkpoint/reopen (`OramState`).
+- `oramctl` CLI for building deterministic test images and running random-read
+  benchmarks.
 - Fixed trace-shape tests: each logical access reads and rewrites a complete
   root-to-leaf path.
 
@@ -55,6 +58,34 @@ The backing store sees random ORAM paths, not BitcoinPIR logical ids.
 
 ```bash
 cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+## CLI Smoke Test
+
+Build an encrypted test image:
+
+```bash
+KEY_HEX=4242424242424242424242424242424242424242424242424242424242424242
+
+cargo run --bin oramctl -- build \
+  --image /tmp/bpir-oram.pages \
+  --state /tmp/bpir-oram.state \
+  --blocks 1024 \
+  --block-size 64 \
+  --encrypted \
+  --key-hex "$KEY_HEX"
+```
+
+Run random reads against it:
+
+```bash
+cargo run --bin oramctl -- bench \
+  --image /tmp/bpir-oram.pages \
+  --state /tmp/bpir-oram.state \
+  --ops 1000 \
+  --encrypted \
+  --key-hex "$KEY_HEX"
 ```
 
 ## Prototype Warning
@@ -63,3 +94,7 @@ This is a correctness and storage-shape prototype. Before production use inside
 SEV-SNP, the hot loops need explicit constant-time hardening and assembly/trace
 inspection. In particular, `find_flushable` currently scans the whole stash but
 still uses ordinary Rust branch/`Option` selection.
+
+The `.state` file contains the position map, stash, and RNG state. It is trusted
+controller state. Do not write it to untrusted storage in plaintext in a real
+deployment; it needs SEV-sealed storage or an AEAD wrapper before production use.

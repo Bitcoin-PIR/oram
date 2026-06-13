@@ -4,12 +4,16 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "BitcoinPIR-shaped disk-backed Path ORAM prototype"
-repository = "https://github.com/bitcoinpir/oram"
+repository = "https://github.com/Bitcoin-PIR/oram"
 
 [dependencies]
+bincode = "1"
 chacha20poly1305 = { version = "0.10", features = ["std"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
 rand = "0.8"
-rand_chacha = "0.3"
+rand_chacha = { version = "0.3", features = ["serde1"] }
+serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 zeroize = "1"
 
