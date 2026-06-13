@@ -8,6 +8,7 @@
 pub mod aead;
 pub mod block;
 pub mod ct;
+pub mod cuckoo;
 pub mod error;
 pub mod oram;
 pub mod params;
@@ -16,6 +17,7 @@ pub mod store;
 
 pub use aead::{AeadPageStore, AEAD_OVERHEAD};
 pub use block::{Bucket, OramBlock};
+pub use cuckoo::{CuckooOramEstimate, CuckooOramSizing, CuckooTableInfo};
 pub use error::{Error, Result};
 pub use oram::PathOram;
 pub use params::OramParams;

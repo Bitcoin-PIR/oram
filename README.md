@@ -25,6 +25,8 @@ Implemented:
   eviction selection.
 - `oramctl` CLI for building deterministic test images and running random-read
   benchmarks.
+- `oramctl size-cuckoo` for estimating ORAM images over existing DPF/Harmony
+  cuckoo tables.
 - Fixed trace-shape tests: each logical access reads and rewrites a complete
   root-to-leaf path.
 
@@ -101,6 +103,27 @@ cargo run --bin oramctl -- bench \
 
 `--cache-levels 4` caches `(1 << 4) - 1 = 15` public top-tree pages in trusted
 memory. Use `0` to disable this wrapper.
+
+## Cuckoo Table Sizing
+
+Estimate ORAM images for the DPF/Harmony cuckoo tables in one or more existing
+BitcoinPIR DB directories:
+
+```bash
+cargo run --bin oramctl -- size-cuckoo \
+  --db-dir /Volumes/Bitcoin/data/checkpoints/948454 \
+  --db-dir /Volumes/Bitcoin/data/deltas/940611_948454 \
+  --packs 4,8,16 \
+  --leaf-divisors 1,2,4,8 \
+  --cache-levels 5
+```
+
+`pack` is the number of consecutive cuckoo bins stored in one logical ORAM
+block. INDEX bins are 52 B and CHUNK bins are 132 B, so `pack=8` uses 416 B
+INDEX blocks and 1056 B CHUNK blocks. `leaf_divisor` controls tree density:
+`leaves = next_power_of_two(ceil(logical_blocks / leaf_divisor))`. Higher values
+reduce disk size but increase stash pressure and must be stress-tested before
+production use.
 
 ## Prototype Warning
 

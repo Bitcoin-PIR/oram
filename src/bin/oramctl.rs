@@ -1,6 +1,6 @@
 use bitcoinpir_oram::{
-    AeadPageStore, Error, FilePageStore, FrontCachedPageStore, OramParams, OramState, PageStore,
-    PathOram, Result, AEAD_OVERHEAD,
+    AeadPageStore, CuckooOramEstimate, CuckooOramSizing, CuckooTableInfo, Error, FilePageStore,
+    FrontCachedPageStore, OramParams, OramState, PageStore, PathOram, Result, AEAD_OVERHEAD,
 };
 use clap::{Parser, Subcommand};
 use rand::{RngCore, SeedableRng};
@@ -87,6 +87,27 @@ enum Command {
         /// Do not write back the updated trusted state.
         #[arg(long)]
         no_save: bool,
+    },
+    /// Estimate ORAM sizes for existing DPF/Harmony cuckoo table directories.
+    SizeCuckoo {
+        /// BitcoinPIR DB directory containing batch_pir_cuckoo.bin and chunk_pir_cuckoo.bin.
+        #[arg(long = "db-dir", required = true)]
+        db_dirs: Vec<PathBuf>,
+        /// Comma-separated bins packed into one ORAM logical block.
+        #[arg(long, value_delimiter = ',', default_value = "8")]
+        packs: Vec<usize>,
+        /// Comma-separated divisors for leaves = next_power_of_two(ceil(blocks / divisor)).
+        #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
+        leaf_divisors: Vec<usize>,
+        /// Physical blocks per ORAM bucket.
+        #[arg(long, default_value_t = 4)]
+        bucket_size: usize,
+        /// Fixed stash capacity in trusted memory.
+        #[arg(long, default_value_t = 512)]
+        stash_capacity: usize,
+        /// Public top ORAM tree levels cached in trusted memory.
+        #[arg(long, default_value_t = 5)]
+        cache_levels: usize,
     },
 }
 
@@ -209,8 +230,183 @@ fn main() -> Result<()> {
             );
             println!("checksum={checksum}");
         }
+        Command::SizeCuckoo {
+            db_dirs,
+            packs,
+            leaf_divisors,
+            bucket_size,
+            stash_capacity,
+            cache_levels,
+        } => {
+            print_cuckoo_sizes(
+                &db_dirs,
+                &packs,
+                &leaf_divisors,
+                bucket_size,
+                stash_capacity,
+                cache_levels,
+            )?;
+        }
     }
     Ok(())
+}
+
+fn print_cuckoo_sizes(
+    db_dirs: &[PathBuf],
+    packs: &[usize],
+    leaf_divisors: &[usize],
+    bucket_size: usize,
+    stash_capacity: usize,
+    cache_levels: usize,
+) -> Result<()> {
+    if packs.is_empty() {
+        return Err(Error::InvalidInput(
+            "at least one --packs value is required".into(),
+        ));
+    }
+    if leaf_divisors.is_empty() {
+        return Err(Error::InvalidInput(
+            "at least one --leaf-divisors value is required".into(),
+        ));
+    }
+
+    println!("size_cuckoo=true");
+    println!("bucket_size={bucket_size}");
+    println!("stash_capacity={stash_capacity}");
+    println!("cache_levels={cache_levels}");
+
+    for db_dir in db_dirs {
+        let tables = CuckooTableInfo::load_pair(db_dir)?;
+        let original_cuckoo_bytes: u64 = tables.iter().map(|t| t.file_bytes).sum();
+        println!(
+            "db db_dir={} original_cuckoo_bytes={} original_cuckoo_gib={:.3}",
+            db_dir.display(),
+            original_cuckoo_bytes,
+            gib(original_cuckoo_bytes)
+        );
+        for table in &tables {
+            println!(
+                "table db_dir={} level={} file_bytes={} file_gib={:.3} anchor={} data_offset={} k={} bins_per_table={} slots_per_bin={} slot_size={} bin_size={} total_bins={} table_byte_size={} master_seed=0x{:016x} tag_seed={}",
+                db_dir.display(),
+                table.level,
+                table.file_bytes,
+                gib(table.file_bytes),
+                table.anchor_kind,
+                table.data_offset,
+                table.k,
+                table.bins_per_table,
+                table.slots_per_bin,
+                table.slot_size,
+                table.bin_size(),
+                table.total_bins(),
+                table.table_byte_size(),
+                table.master_seed,
+                table
+                    .tag_seed
+                    .map(|seed| format!("0x{seed:016x}"))
+                    .unwrap_or_else(|| "none".to_string())
+            );
+        }
+
+        for &pack in packs {
+            for &leaf_divisor in leaf_divisors {
+                let sizing = CuckooOramSizing {
+                    bins_per_block: pack,
+                    leaf_divisor,
+                    bucket_size,
+                    stash_capacity,
+                    cache_levels,
+                };
+                let mut total_image_plaintext = 0u64;
+                let mut total_image_aead = 0u64;
+                let mut total_pos_map = 0u64;
+                let mut total_trusted_state_floor = 0u64;
+                let mut total_front_cache_plaintext = 0u64;
+                let mut total_front_cache_aead = 0u64;
+
+                for table in &tables {
+                    let estimate = sizing.estimate(table)?;
+                    print_estimate(db_dir, &estimate);
+                    total_image_plaintext += estimate.image_plaintext_bytes;
+                    total_image_aead += estimate.image_aead_bytes;
+                    total_pos_map += estimate.pos_map_bytes;
+                    total_trusted_state_floor += estimate.trusted_state_floor_bytes;
+                    total_front_cache_plaintext += estimate.front_cache_plaintext_bytes;
+                    total_front_cache_aead += estimate.front_cache_aead_bytes;
+                }
+
+                println!(
+                    "total db_dir={} pack={} leaf_divisor={} image_plaintext_bytes={} image_plaintext_gib={:.3} image_aead_bytes={} image_aead_gib={:.3} original_cuckoo_bytes={} original_cuckoo_gib={:.3} expansion_aead_vs_cuckoo={:.3} pos_map_bytes={} pos_map_mib={:.3} trusted_state_floor_bytes={} trusted_state_floor_mib={:.3} front_cache_plaintext_bytes={} front_cache_plaintext_mib={:.3} front_cache_aead_bytes={} front_cache_aead_mib={:.3}",
+                    db_dir.display(),
+                    pack,
+                    leaf_divisor,
+                    total_image_plaintext,
+                    gib(total_image_plaintext),
+                    total_image_aead,
+                    gib(total_image_aead),
+                    original_cuckoo_bytes,
+                    gib(original_cuckoo_bytes),
+                    total_image_aead as f64 / original_cuckoo_bytes.max(1) as f64,
+                    total_pos_map,
+                    mib(total_pos_map),
+                    total_trusted_state_floor,
+                    mib(total_trusted_state_floor),
+                    total_front_cache_plaintext,
+                    mib(total_front_cache_plaintext),
+                    total_front_cache_aead,
+                    mib(total_front_cache_aead),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_estimate(db_dir: &Path, e: &CuckooOramEstimate) {
+    println!(
+        "estimate db_dir={} level={} pack={} leaf_divisor={} total_bins={} logical_blocks={} block_payload_bytes={} bucket_size={} leaves={} height={} bucket_pages={} page_plaintext_bytes={} page_aead_bytes={} image_plaintext_bytes={} image_plaintext_gib={:.3} image_aead_bytes={} image_aead_gib={:.3} pos_map_bytes={} pos_map_mib={:.3} trusted_stash_bytes={} trusted_stash_mib={:.3} trusted_state_floor_bytes={} trusted_state_floor_mib={:.3} cached_pages={} front_cache_plaintext_bytes={} front_cache_plaintext_mib={:.3} front_cache_aead_bytes={} front_cache_aead_mib={:.3} disk_pages_per_access_no_flush={} disk_aead_bytes_per_access_no_flush={} disk_aead_mib_per_access_no_flush={:.3} tree_slot_load_percent={:.3}",
+        db_dir.display(),
+        e.level,
+        e.bins_per_block,
+        e.leaf_divisor,
+        e.total_bins,
+        e.logical_blocks,
+        e.block_payload_bytes,
+        e.bucket_size,
+        e.leaves,
+        e.height,
+        e.bucket_pages,
+        e.page_plaintext_bytes,
+        e.page_aead_bytes,
+        e.image_plaintext_bytes,
+        gib(e.image_plaintext_bytes),
+        e.image_aead_bytes,
+        gib(e.image_aead_bytes),
+        e.pos_map_bytes,
+        mib(e.pos_map_bytes),
+        e.trusted_stash_bytes,
+        mib(e.trusted_stash_bytes),
+        e.trusted_state_floor_bytes,
+        mib(e.trusted_state_floor_bytes),
+        e.cached_pages,
+        e.front_cache_plaintext_bytes,
+        mib(e.front_cache_plaintext_bytes),
+        e.front_cache_aead_bytes,
+        mib(e.front_cache_aead_bytes),
+        e.disk_pages_per_access_no_flush,
+        e.disk_aead_bytes_per_access_no_flush,
+        mib(e.disk_aead_bytes_per_access_no_flush),
+        e.tree_slot_load_percent,
+    );
+}
+
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0 / 1024.0
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0
 }
 
 fn load_state(path: &Path, state_key_hex: Option<&str>) -> Result<OramState> {
