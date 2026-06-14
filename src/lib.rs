@@ -15,6 +15,7 @@ pub mod oram;
 pub mod params;
 pub mod state;
 pub mod store;
+pub mod stress;
 
 pub use aead::{AeadPageStore, AEAD_OVERHEAD};
 pub use block::{Bucket, OramBlock};
@@ -25,3 +26,4 @@ pub use oram::PathOram;
 pub use params::OramParams;
 pub use state::OramState;
 pub use store::{FilePageStore, FrontCachedPageStore, MemPageStore, PageStore, TracingStore};
+pub use stress::{stress_circuit, CircuitStressConfig, CircuitStressPattern, CircuitStressReport};

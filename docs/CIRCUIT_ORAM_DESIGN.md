@@ -161,7 +161,7 @@ The `Z=2` choice is supported by empirical results in the paper and by later
 TEE-oriented systems, not by the same clean theorem. For BitcoinPIR this means
 `Z=2` is a candidate that must pass workload-specific stress testing.
 
-The next tool should simulate:
+The `oramctl stress-circuit` tool now simulates:
 
 ```text
 random query sequence
@@ -181,6 +181,12 @@ overflow count for configured capacity
 eviction debt distribution
 metadata and payload page I/O per logical access
 ```
+
+The simulator is metadata-only. It tracks logical ids, leaf labels, bucket
+slots, stash occupancy, and public eviction debt, and it models Circuit ORAM's
+deterministic eviction schedule with greedy path eviction. This is the right
+tool for parameter exploration, but it is not a replacement for implementing
+the real `deepest`/`target` metadata scans and auditing the final page trace.
 
 ## Crash Consistency
 
@@ -203,8 +209,8 @@ eviction to cross a durable boundary.
 
 ## Implementation Milestones
 
-1. Add deterministic Circuit ORAM scheduler and tests.
-2. Add `oramctl stress-circuit` simulator over real cuckoo table sizes.
+1. Add deterministic Circuit ORAM scheduler and tests. Done.
+2. Add `oramctl stress-circuit` simulator over real cuckoo table sizes. Done.
 3. Split metadata/payload page models in the simulator and sizing output.
 4. Implement a `CircuitOram` controller using the existing `PageStore` traits.
 5. Add encrypted metadata and payload stores with fixed-shape trace tests.

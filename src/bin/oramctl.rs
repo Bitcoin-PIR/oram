@@ -1,8 +1,9 @@
 use bitcoinpir_oram::{
-    AeadPageStore, CuckooOramEstimate, CuckooOramSizing, CuckooTableInfo, Error, FilePageStore,
+    stress_circuit, AeadPageStore, CircuitStressConfig, CircuitStressPattern, CircuitStressReport,
+    CuckooOramEstimate, CuckooOramSizing, CuckooTableInfo, Error, FilePageStore,
     FrontCachedPageStore, OramParams, OramState, PageStore, PathOram, Result, AEAD_OVERHEAD,
 };
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::{
@@ -109,6 +110,63 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         cache_levels: usize,
     },
+    /// Stress-test Circuit ORAM stash pressure over DPF/Harmony cuckoo table sizes.
+    StressCircuit {
+        /// BitcoinPIR DB directory containing batch_pir_cuckoo.bin and chunk_pir_cuckoo.bin.
+        #[arg(long = "db-dir", required = true)]
+        db_dirs: Vec<PathBuf>,
+        /// Comma-separated bins packed into one ORAM logical block.
+        #[arg(long, value_delimiter = ',', default_value = "16")]
+        packs: Vec<usize>,
+        /// Comma-separated divisors for leaves = next_power_of_two(ceil(blocks / divisor)).
+        #[arg(long, value_delimiter = ',', default_value = "4")]
+        leaf_divisors: Vec<usize>,
+        /// Physical blocks per Circuit ORAM bucket.
+        #[arg(long, default_value_t = 2)]
+        bucket_size: usize,
+        /// Fixed stash capacity in trusted memory.
+        #[arg(long, default_value_t = 512)]
+        stash_capacity: usize,
+        /// Measured real accesses per table/config.
+        #[arg(long, default_value_t = 100_000)]
+        ops: usize,
+        /// Warm-up accesses excluded from stash percentiles.
+        #[arg(long, default_value_t = 10_000)]
+        warmup_ops: usize,
+        /// Public logical-id sequence.
+        #[arg(long, value_enum, default_value_t = StressPatternArg::Random)]
+        pattern: StressPatternArg,
+        /// Public eviction paths drained after each real access.
+        #[arg(long, default_value_t = 2)]
+        drain_per_access: u64,
+        /// Public burst interval. Zero disables burst draining.
+        #[arg(long, default_value_t = 0)]
+        burst_interval: usize,
+        /// Public eviction paths drained when --burst-interval fires.
+        #[arg(long, default_value_t = 0)]
+        burst_budget: u64,
+        /// Optional public maximum pending eviction debt.
+        #[arg(long)]
+        max_debt: Option<u64>,
+        /// 32-byte hex simulator RNG seed. Defaults to all 0x05.
+        #[arg(long)]
+        seed_hex: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum StressPatternArg {
+    Random,
+    RoundRobin,
+}
+
+impl From<StressPatternArg> for CircuitStressPattern {
+    fn from(value: StressPatternArg) -> Self {
+        match value {
+            StressPatternArg::Random => Self::Random,
+            StressPatternArg::RoundRobin => Self::RoundRobin,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -247,6 +305,37 @@ fn main() -> Result<()> {
                 cache_levels,
             )?;
         }
+        Command::StressCircuit {
+            db_dirs,
+            packs,
+            leaf_divisors,
+            bucket_size,
+            stash_capacity,
+            ops,
+            warmup_ops,
+            pattern,
+            drain_per_access,
+            burst_interval,
+            burst_budget,
+            max_debt,
+            seed_hex,
+        } => {
+            print_circuit_stress(
+                &db_dirs,
+                &packs,
+                &leaf_divisors,
+                bucket_size,
+                stash_capacity,
+                ops,
+                warmup_ops,
+                pattern.into(),
+                drain_per_access,
+                burst_interval,
+                burst_budget,
+                max_debt,
+                parse_seed(seed_hex.as_deref(), 0x05)?,
+            )?;
+        }
     }
     Ok(())
 }
@@ -361,6 +450,140 @@ fn print_cuckoo_sizes(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_circuit_stress(
+    db_dirs: &[PathBuf],
+    packs: &[usize],
+    leaf_divisors: &[usize],
+    bucket_size: usize,
+    stash_capacity: usize,
+    ops: usize,
+    warmup_ops: usize,
+    pattern: CircuitStressPattern,
+    drain_per_access: u64,
+    burst_interval: usize,
+    burst_budget: u64,
+    max_debt: Option<u64>,
+    seed: [u8; 32],
+) -> Result<()> {
+    if packs.is_empty() {
+        return Err(Error::InvalidInput(
+            "at least one --packs value is required".into(),
+        ));
+    }
+    if leaf_divisors.is_empty() {
+        return Err(Error::InvalidInput(
+            "at least one --leaf-divisors value is required".into(),
+        ));
+    }
+
+    println!("stress_circuit=true");
+    println!("bucket_size={bucket_size}");
+    println!("stash_capacity={stash_capacity}");
+    println!("ops={ops}");
+    println!("warmup_ops={warmup_ops}");
+    println!("pattern={}", pattern.label());
+    println!("drain_per_access={drain_per_access}");
+    println!("burst_interval={burst_interval}");
+    println!("burst_budget={burst_budget}");
+    println!("seed_hex={}", hex::encode(seed));
+    println!(
+        "max_debt={}",
+        max_debt
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+
+    for db_dir in db_dirs {
+        let tables = CuckooTableInfo::load_pair(db_dir)?;
+        for table in &tables {
+            for &pack in packs {
+                for &leaf_divisor in leaf_divisors {
+                    let sizing = CuckooOramSizing {
+                        bins_per_block: pack,
+                        leaf_divisor,
+                        bucket_size,
+                        stash_capacity,
+                        cache_levels: 0,
+                    };
+                    let estimate = sizing.estimate(table)?;
+                    let params = OramParams::with_leaves(
+                        estimate.logical_blocks,
+                        estimate.block_payload_bytes,
+                        estimate.leaves,
+                    )?
+                    .with_bucket_size(bucket_size)?
+                    .with_stash_capacity(stash_capacity)?;
+                    let report = stress_circuit(CircuitStressConfig {
+                        params,
+                        ops,
+                        warmup_ops,
+                        pattern,
+                        seed,
+                        drain_per_access,
+                        burst_interval,
+                        burst_budget,
+                        max_debt,
+                    })?;
+                    print_stress_report(db_dir, table, &estimate, &report);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_stress_report(
+    db_dir: &Path,
+    table: &CuckooTableInfo,
+    estimate: &CuckooOramEstimate,
+    report: &CircuitStressReport,
+) {
+    println!(
+        "stress db_dir={} level={} anchor={} pack={} leaf_divisor={} total_bins={} logical_blocks={} block_payload_bytes={} bucket_size={} leaves={} height={} tree_slots={} tree_slot_load_percent={:.3} ops={} warmup_ops={} pattern={} stash_capacity={} init_stash={} final_stash={} max_stash={} avg_stash={:.3} p50_stash={} p99_stash={} p999_stash={} overflow_samples={} evictions_per_access={} drain_per_access={} burst_interval={} burst_budget={} max_debt_cap={} max_eviction_debt={} final_eviction_debt={} completed_evictions={} scheduled_evictions={} metadata_path_scans_per_access={:.3} payload_path_scans_per_access={:.3}",
+        db_dir.display(),
+        table.level,
+        table.anchor_kind,
+        estimate.bins_per_block,
+        estimate.leaf_divisor,
+        estimate.total_bins,
+        report.logical_blocks,
+        estimate.block_payload_bytes,
+        report.bucket_size,
+        report.leaves,
+        report.height,
+        report.tree_slots,
+        report.tree_slot_load_percent,
+        report.ops,
+        report.warmup_ops,
+        report.pattern.label(),
+        report.stash_capacity,
+        report.init_stash,
+        report.final_stash,
+        report.max_stash,
+        report.avg_stash,
+        report.p50_stash,
+        report.p99_stash,
+        report.p999_stash,
+        report.overflow_samples,
+        report.evictions_per_access,
+        report.drain_per_access,
+        report.burst_interval,
+        report.burst_budget,
+        report
+            .max_debt_cap
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        report.max_eviction_debt,
+        report.final_eviction_debt,
+        report.completed_evictions,
+        report.scheduled_evictions,
+        report.metadata_path_scans_per_access,
+        report.payload_path_scans_per_access,
+    );
 }
 
 fn print_estimate(db_dir: &Path, e: &CuckooOramEstimate) {

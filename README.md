@@ -30,11 +30,12 @@ Implemented:
 - Fixed trace-shape tests: each logical access reads and rewrites a complete
   root-to-leaf path.
 - Circuit ORAM deterministic eviction scheduler and design notes.
+- `oramctl stress-circuit` metadata-only stash-pressure simulator for the
+  planned Circuit ORAM controller.
 
 Intentionally not implemented yet:
 
 - Circuit ORAM controller.
-- Circuit ORAM stash-pressure simulator.
 - Recursive position map.
 - Oblivious bulk initialization.
 - Crash-safe checkpointing or WAL.
@@ -131,6 +132,41 @@ INDEX blocks and 1056 B CHUNK blocks. `leaf_divisor` controls tree density:
 `leaves = next_power_of_two(ceil(logical_blocks / leaf_divisor))`. Higher values
 reduce disk size but increase stash pressure and must be stress-tested before
 production use.
+
+## Circuit ORAM Stress Simulation
+
+Run a metadata-only Circuit ORAM stash-pressure simulation over DPF/Harmony
+cuckoo table sizes:
+
+```bash
+cargo run --bin oramctl -- stress-circuit \
+  --db-dir /Volumes/Bitcoin/data/checkpoints/940611 \
+  --packs 16 \
+  --leaf-divisors 4 \
+  --bucket-size 2 \
+  --stash-capacity 4096 \
+  --ops 100000 \
+  --warmup-ops 10000 \
+  --pattern random \
+  --drain-per-access 2
+```
+
+To model public delayed eviction, reduce `--drain-per-access` and set a public
+debt cap:
+
+```bash
+cargo run --bin oramctl -- stress-circuit \
+  --db-dir /Volumes/Bitcoin/data/checkpoints/940611 \
+  --drain-per-access 0 \
+  --max-debt 128 \
+  --ops 100000
+```
+
+The simulator stores only logical block ids, leaf labels, tree slots, and stash
+entries. It uses greedy path eviction as a stress model for Circuit ORAM's
+deterministic eviction schedule. It is useful for choosing `Z`, stash capacity,
+tree density, and public eviction-debt bounds; it is not a proof and it does
+not replace the controller trace audit.
 
 ## Prototype Warning
 
