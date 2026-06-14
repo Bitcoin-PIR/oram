@@ -1,9 +1,9 @@
 use bitcoinpir_oram::{
     circuit_meta_page_bytes, circuit_payload_page_bytes, stress_circuit, AeadPageStore,
-    CircuitOram, CircuitOramState, CircuitStressConfig, CircuitStressPattern, CircuitStressReport,
-    CuckooLevel, CuckooOramEstimate, CuckooOramSizing, CuckooPackedBlockReader, CuckooTableInfo,
-    Error, FilePageStore, FrontCachedPageStore, OramParams, OramState, PageStore, PathOram, Result,
-    AEAD_OVERHEAD,
+    CircuitCuckooBinReader, CircuitOram, CircuitOramState, CircuitStressConfig,
+    CircuitStressPattern, CircuitStressReport, CuckooLevel, CuckooOramEstimate, CuckooOramSizing,
+    CuckooPackedBlockReader, CuckooTableInfo, Error, FilePageStore, FrontCachedPageStore,
+    OramParams, OramState, PageStore, PathOram, Result, AEAD_OVERHEAD,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::{RngCore, SeedableRng};
@@ -185,6 +185,45 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         cache_levels: usize,
         /// 32-byte hex query RNG seed. Defaults to all 0x04.
+        #[arg(long)]
+        query_seed_hex: Option<String>,
+        /// Do not write back state. ORAM reads still mutate image pages; use only for disposable images.
+        #[arg(long)]
+        no_save: bool,
+    },
+    /// Verify original cuckoo bins read through split-store Circuit ORAM images.
+    VerifyCircuitBins {
+        /// ORAM image directory containing index/chunk metadata, payload, and state files.
+        #[arg(long)]
+        oram_dir: PathBuf,
+        /// BitcoinPIR DB directory containing batch_pir_cuckoo.bin and chunk_pir_cuckoo.bin.
+        #[arg(long)]
+        db_dir: PathBuf,
+        /// Which Circuit ORAM instance to verify.
+        #[arg(long, value_enum, default_value_t = LevelArg::All)]
+        level: LevelArg,
+        /// Consecutive cuckoo bins packed into one ORAM logical block.
+        #[arg(long, default_value_t = 16)]
+        pack: usize,
+        /// Number of random cuckoo bins per selected level.
+        #[arg(long, default_value_t = 1000)]
+        bins: usize,
+        /// Public eviction paths drained after each bin read.
+        #[arg(long, default_value_t = 2)]
+        drain_per_access: u64,
+        /// Enable page AEAD for metadata and payload images.
+        #[arg(long)]
+        encrypted: bool,
+        /// 32-byte hex page encryption key. Required with --encrypted.
+        #[arg(long)]
+        key_hex: Option<String>,
+        /// 32-byte hex state encryption key. Required if state was encrypted.
+        #[arg(long)]
+        state_key_hex: Option<String>,
+        /// Cache this many public top ORAM tree levels in trusted memory.
+        #[arg(long, default_value_t = 0)]
+        cache_levels: usize,
+        /// 32-byte hex query RNG seed. Defaults to all 0x08.
         #[arg(long)]
         query_seed_hex: Option<String>,
         /// Do not write back state. ORAM reads still mutate image pages; use only for disposable images.
@@ -458,6 +497,35 @@ fn main() -> Result<()> {
                 state_key_hex.as_deref(),
                 cache_levels,
                 parse_seed(query_seed_hex.as_deref(), 0x04)?,
+                no_save,
+            )?;
+        }
+        Command::VerifyCircuitBins {
+            oram_dir,
+            db_dir,
+            level,
+            pack,
+            bins,
+            drain_per_access,
+            encrypted,
+            key_hex,
+            state_key_hex,
+            cache_levels,
+            query_seed_hex,
+            no_save,
+        } => {
+            verify_circuit_bins(
+                &oram_dir,
+                &db_dir,
+                level,
+                pack,
+                bins,
+                drain_per_access,
+                encrypted,
+                key_hex.as_deref(),
+                state_key_hex.as_deref(),
+                cache_levels,
+                parse_seed(query_seed_hex.as_deref(), 0x08)?,
                 no_save,
             )?;
         }
@@ -946,6 +1014,151 @@ fn bench_circuit_table(
         drained,
         elapsed.as_millis(),
         elapsed.as_secs_f64() * 1_000_000.0 / ops.max(1) as f64,
+        checksum,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_circuit_bins(
+    oram_dir: &Path,
+    db_dir: &Path,
+    level: LevelArg,
+    pack: usize,
+    bins: usize,
+    drain_per_access: u64,
+    encrypted: bool,
+    key_hex: Option<&str>,
+    state_key_hex: Option<&str>,
+    cache_levels: usize,
+    query_seed: [u8; 32],
+    no_save: bool,
+) -> Result<()> {
+    if pack == 0 {
+        return Err(Error::InvalidInput("--pack must be > 0".into()));
+    }
+    if encrypted {
+        parse_required_key(key_hex)?;
+    }
+    let tables = CuckooTableInfo::load_pair(db_dir)?;
+
+    println!("verify_circuit_bins=true");
+    println!("oram_dir={}", oram_dir.display());
+    println!("db_dir={}", db_dir.display());
+    println!("level={level:?}");
+    println!("pack={pack}");
+    println!("bins={bins}");
+    println!("drain_per_access={drain_per_access}");
+    println!("encrypted={encrypted}");
+    println!("state_encrypted={}", state_key_hex.is_some());
+    println!("cache_levels={cache_levels}");
+    println!("query_seed_hex={}", hex::encode(query_seed));
+    println!("no_save={no_save}");
+
+    for &selected_level in level.levels() {
+        let table = tables
+            .iter()
+            .find(|table| table.level == selected_level)
+            .expect("load_pair returns both levels");
+        verify_circuit_bin_table(
+            oram_dir,
+            table,
+            pack,
+            bins,
+            drain_per_access,
+            encrypted,
+            key_hex,
+            state_key_hex,
+            cache_levels,
+            derive_level_seed(query_seed, selected_level),
+            no_save,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_circuit_bin_table(
+    oram_dir: &Path,
+    table: &CuckooTableInfo,
+    pack: usize,
+    bins: usize,
+    drain_per_access: u64,
+    encrypted: bool,
+    key_hex: Option<&str>,
+    state_key_hex: Option<&str>,
+    cache_levels: usize,
+    query_seed: [u8; 32],
+    no_save: bool,
+) -> Result<()> {
+    let paths = circuit_output_paths(oram_dir, table.level);
+    let loaded = load_circuit_state(&paths.state, state_key_hex)?;
+    let params = loaded.params.clone();
+    let cached_pages = cached_pages_for_levels(&params, cache_levels)?;
+    let (meta_store, payload_store) = open_circuit_file_stores(
+        &paths.meta_image,
+        &paths.payload_image,
+        &params,
+        encrypted,
+        key_hex,
+        cached_pages,
+        true,
+    )?;
+    let oram = CircuitOram::from_state(meta_store, payload_store, loaded)?;
+    let mut oram_reader = CircuitCuckooBinReader::new(table, pack, oram)?;
+    let mut source_reader = CuckooPackedBlockReader::open(table.clone(), pack)?;
+    let mut query_rng = ChaCha20Rng::from_seed(query_seed);
+    let pending_before = oram_reader.oram().pending_evictions()?;
+
+    let started = Instant::now();
+    let mut checksum = 0u64;
+    let mut verified = 0usize;
+    let mut drained = 0u64;
+    for _ in 0..bins {
+        let bin_id = query_rng.next_u64() as usize % table.total_bins();
+        let got = oram_reader.read_bin(bin_id, drain_per_access)?;
+        let expected = source_reader.read_bin(bin_id)?;
+        if got.payload != expected {
+            return Err(Error::InvalidInput(format!(
+                "{} bin {} did not match original cuckoo payload",
+                table.level, bin_id
+            )));
+        }
+        checksum = checksum_payload(checksum, &got.payload);
+        verified += 1;
+        drained += got.drained_evictions;
+    }
+    let elapsed = started.elapsed();
+    let mut oram = oram_reader.into_oram();
+    oram.flush()?;
+    if !no_save {
+        save_circuit_state(&oram.snapshot(), &paths.state, state_key_hex)?;
+    }
+
+    println!(
+        "verify_bins level={} meta_image={} payload_image={} state={} bins={} verified={} total_bins={} bin_size={} pack={} logical_blocks={} block_payload_bytes={} leaves={} height={} cached_pages={} stash_len={} pending_before={} pending_after={} drained_evictions={} elapsed_ms={} avg_us={:.3} checksum={}",
+        table.level,
+        paths.meta_image.display(),
+        paths.payload_image.display(),
+        paths.state.display(),
+        bins,
+        verified,
+        table.total_bins(),
+        table.bin_size(),
+        pack,
+        params.logical_blocks,
+        params.block_size,
+        params.leaves,
+        params.height(),
+        cached_pages,
+        oram.stash_len(),
+        pending_before,
+        oram.pending_evictions()?,
+        drained,
+        elapsed.as_millis(),
+        elapsed.as_secs_f64() * 1_000_000.0 / bins.max(1) as f64,
         checksum,
     );
 

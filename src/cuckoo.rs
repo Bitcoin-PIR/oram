@@ -4,7 +4,9 @@
 //! the ORAM adapter. OnionPIR artifacts have a different encoding and are out
 //! of scope for this crate.
 
-use crate::{Error, OramBlock, OramParams, Result, TrustedBlockSource, AEAD_OVERHEAD};
+use crate::{
+    CircuitOram, Error, OramBlock, OramParams, PageStore, Result, TrustedBlockSource, AEAD_OVERHEAD,
+};
 use memmap2::{Mmap, MmapOptions};
 use std::{
     fmt,
@@ -439,6 +441,18 @@ impl CuckooPackedBlockReader {
         self.block_payload_bytes
     }
 
+    /// Read one original cuckoo bin payload by global bin id.
+    pub fn read_bin(&mut self, bin_id: usize) -> Result<Vec<u8>> {
+        let location = locate_packed_cuckoo_bin(
+            self.table.total_bins(),
+            self.bins_per_block,
+            self.table.bin_size(),
+            bin_id,
+        )?;
+        let block = self.read_block(location.logical_block)?;
+        Ok(block[location.byte_range()].to_vec())
+    }
+
     /// Read one packed logical block without changing iterator progress.
     pub fn read_block(&mut self, logical_block: usize) -> Result<Vec<u8>> {
         if logical_block >= self.logical_blocks {
@@ -465,6 +479,170 @@ impl CuckooPackedBlockReader {
         let mut payload = vec![0u8; self.block_payload_bytes];
         payload[..bytes_to_read].copy_from_slice(&self.mmap[offset..end]);
         Ok(payload)
+    }
+}
+
+/// Location of one cuckoo bin inside a packed ORAM logical block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackedCuckooBinLocation {
+    /// ORAM logical block id.
+    pub logical_block: usize,
+    /// Byte offset inside the logical block.
+    pub byte_offset: usize,
+    /// Number of bytes in the bin.
+    pub byte_len: usize,
+}
+
+impl PackedCuckooBinLocation {
+    fn byte_range(self) -> std::ops::Range<usize> {
+        self.byte_offset..self.byte_offset + self.byte_len
+    }
+}
+
+/// Map a global cuckoo bin id to its packed ORAM block and byte range.
+pub fn locate_packed_cuckoo_bin(
+    total_bins: usize,
+    bins_per_block: usize,
+    bin_size: usize,
+    bin_id: usize,
+) -> Result<PackedCuckooBinLocation> {
+    if bins_per_block == 0 {
+        return Err(Error::InvalidInput("bins_per_block must be > 0".into()));
+    }
+    if bin_size == 0 {
+        return Err(Error::InvalidInput("bin_size must be > 0".into()));
+    }
+    if bin_id >= total_bins {
+        return Err(Error::InvalidInput(format!(
+            "bin_id {} out of range {}",
+            bin_id, total_bins
+        )));
+    }
+
+    let slot_in_block = bin_id % bins_per_block;
+    Ok(PackedCuckooBinLocation {
+        logical_block: bin_id / bins_per_block,
+        byte_offset: slot_in_block * bin_size,
+        byte_len: bin_size,
+    })
+}
+
+/// Result of reading one cuckoo bin through a Circuit ORAM image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitCuckooBinRead {
+    /// Original global cuckoo bin id.
+    pub bin_id: usize,
+    /// ORAM logical block id read to recover this bin.
+    pub logical_block: usize,
+    /// Byte offset inside the packed ORAM block.
+    pub byte_offset: usize,
+    /// Cuckoo bin payload bytes.
+    pub payload: Vec<u8>,
+    /// Public eviction paths drained after the read.
+    pub drained_evictions: u64,
+}
+
+/// Reader that exposes original cuckoo bins through a packed Circuit ORAM image.
+pub struct CircuitCuckooBinReader<M, P> {
+    level: CuckooLevel,
+    total_bins: usize,
+    bins_per_block: usize,
+    bin_size: usize,
+    oram: CircuitOram<M, P>,
+}
+
+impl<M: PageStore, P: PageStore> CircuitCuckooBinReader<M, P> {
+    /// Wrap an opened Circuit ORAM controller for the matching cuckoo table.
+    pub fn new(
+        table: &CuckooTableInfo,
+        bins_per_block: usize,
+        oram: CircuitOram<M, P>,
+    ) -> Result<Self> {
+        if bins_per_block == 0 {
+            return Err(Error::InvalidInput("bins_per_block must be > 0".into()));
+        }
+        let expected_logical_blocks = table.total_bins().div_ceil(bins_per_block);
+        let expected_block_size = table.bin_size() * bins_per_block;
+        if oram.params().logical_blocks != expected_logical_blocks {
+            return Err(Error::InvalidInput(format!(
+                "{} ORAM logical_blocks {} != packed cuckoo logical_blocks {}",
+                table.level,
+                oram.params().logical_blocks,
+                expected_logical_blocks
+            )));
+        }
+        if oram.params().block_size != expected_block_size {
+            return Err(Error::InvalidInput(format!(
+                "{} ORAM block_size {} != packed cuckoo block_size {}",
+                table.level,
+                oram.params().block_size,
+                expected_block_size
+            )));
+        }
+
+        Ok(Self {
+            level: table.level,
+            total_bins: table.total_bins(),
+            bins_per_block,
+            bin_size: table.bin_size(),
+            oram,
+        })
+    }
+
+    /// BitcoinPIR cuckoo level served by this reader.
+    pub const fn level(&self) -> CuckooLevel {
+        self.level
+    }
+
+    /// Total original cuckoo bins addressable through this reader.
+    pub const fn total_bins(&self) -> usize {
+        self.total_bins
+    }
+
+    /// Original cuckoo bin payload size.
+    pub const fn bin_size(&self) -> usize {
+        self.bin_size
+    }
+
+    /// Packed bins per ORAM logical block.
+    pub const fn bins_per_block(&self) -> usize {
+        self.bins_per_block
+    }
+
+    /// Borrow the underlying Circuit ORAM controller.
+    pub const fn oram(&self) -> &CircuitOram<M, P> {
+        &self.oram
+    }
+
+    /// Mutably borrow the underlying Circuit ORAM controller.
+    pub fn oram_mut(&mut self) -> &mut CircuitOram<M, P> {
+        &mut self.oram
+    }
+
+    /// Consume the reader and return the underlying Circuit ORAM controller.
+    pub fn into_oram(self) -> CircuitOram<M, P> {
+        self.oram
+    }
+
+    /// Read one original cuckoo bin and drain public eviction debt.
+    pub fn read_bin(
+        &mut self,
+        bin_id: usize,
+        drain_per_access: u64,
+    ) -> Result<CircuitCuckooBinRead> {
+        let location =
+            locate_packed_cuckoo_bin(self.total_bins, self.bins_per_block, self.bin_size, bin_id)?;
+        let block = self.oram.read(location.logical_block as u64)?;
+        let payload = block[location.byte_range()].to_vec();
+        let drained_evictions = self.oram.drain_evictions(drain_per_access)?;
+
+        Ok(CircuitCuckooBinRead {
+            bin_id,
+            logical_block: location.logical_block,
+            byte_offset: location.byte_offset,
+            payload,
+            drained_evictions,
+        })
     }
 }
 
@@ -521,6 +699,7 @@ fn checked_next_power_of_two(value: usize) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{circuit_meta_page_bytes, circuit_payload_page_bytes, CircuitOram, MemPageStore};
     use std::io::Write as _;
 
     fn write_sample_table(path: &Path, level: CuckooLevel, bins_per_table: u32) {
@@ -655,5 +834,93 @@ mod tests {
 
         let first = reader.next().unwrap().unwrap();
         assert_eq!(&first[..bin_size], vec![0u8; bin_size]);
+    }
+
+    #[test]
+    fn locates_packed_cuckoo_bins() {
+        assert_eq!(
+            locate_packed_cuckoo_bin(25, 8, 52, 0).unwrap(),
+            PackedCuckooBinLocation {
+                logical_block: 0,
+                byte_offset: 0,
+                byte_len: 52,
+            }
+        );
+        assert_eq!(
+            locate_packed_cuckoo_bin(25, 8, 52, 17).unwrap(),
+            PackedCuckooBinLocation {
+                logical_block: 2,
+                byte_offset: 52,
+                byte_len: 52,
+            }
+        );
+        assert!(locate_packed_cuckoo_bin(25, 8, 52, 25).is_err());
+        assert!(locate_packed_cuckoo_bin(25, 0, 52, 0).is_err());
+    }
+
+    #[test]
+    fn packed_block_reader_reads_individual_bins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_CUCKOO_FILE);
+        write_pattern_table(&path, CuckooLevel::Index, 3);
+        let info = CuckooTableInfo::from_file(CuckooLevel::Index, &path).unwrap();
+        let bin_size = info.bin_size();
+        let mut reader = CuckooPackedBlockReader::open(info, 7).unwrap();
+
+        assert_eq!(reader.read_bin(0).unwrap(), vec![0u8; bin_size]);
+        assert_eq!(reader.read_bin(8).unwrap(), vec![8u8; bin_size]);
+        assert_eq!(reader.read_bin(224).unwrap(), vec![224u8; bin_size]);
+        assert!(reader.read_bin(225).is_err());
+    }
+
+    #[test]
+    fn circuit_cuckoo_bin_reader_matches_original_bins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_CUCKOO_FILE);
+        write_pattern_table(&path, CuckooLevel::Index, 3);
+        let info = CuckooTableInfo::from_file(CuckooLevel::Index, &path).unwrap();
+        let pack = 7;
+        let source = CuckooPackedBlockReader::open(info.clone(), pack).unwrap();
+        let params = OramParams::with_leaves(
+            source.logical_blocks(),
+            source.block_payload_bytes(),
+            source.logical_blocks().max(2).next_power_of_two(),
+        )
+        .unwrap()
+        .with_bucket_size(2)
+        .unwrap()
+        .with_stash_capacity(128)
+        .unwrap();
+        let meta_store = MemPageStore::new(
+            params.bucket_count(),
+            circuit_meta_page_bytes(params.bucket_size),
+        )
+        .unwrap();
+        let payload_store = MemPageStore::new(
+            params.bucket_count(),
+            circuit_payload_page_bytes(params.bucket_size, params.block_size),
+        )
+        .unwrap();
+        let oram = CircuitOram::build_trusted_from_source(
+            params,
+            meta_store,
+            payload_store,
+            source,
+            [31; 32],
+        )
+        .unwrap();
+        let mut oram_reader = CircuitCuckooBinReader::new(&info, pack, oram).unwrap();
+        let mut original = CuckooPackedBlockReader::open(info, pack).unwrap();
+
+        for bin_id in [0usize, 1, 6, 7, 55, 224] {
+            let got = oram_reader.read_bin(bin_id, 2).unwrap();
+            let expected = original.read_bin(bin_id).unwrap();
+            assert_eq!(got.payload, expected);
+            assert_eq!(got.bin_id, bin_id);
+            assert_eq!(got.logical_block, bin_id / pack);
+            assert_eq!(got.drained_evictions, 2);
+        }
+        assert_eq!(oram_reader.oram().pending_evictions().unwrap(), 0);
+        assert_eq!(oram_reader.oram().stash_len(), 0);
     }
 }

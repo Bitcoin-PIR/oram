@@ -24,7 +24,9 @@ pub use circuit::{
     CircuitOram, TrustedBlockSource,
 };
 pub use cuckoo::{
-    CuckooLevel, CuckooOramEstimate, CuckooOramSizing, CuckooPackedBlockReader, CuckooTableInfo,
+    locate_packed_cuckoo_bin, CircuitCuckooBinRead, CircuitCuckooBinReader, CuckooLevel,
+    CuckooOramEstimate, CuckooOramSizing, CuckooPackedBlockReader, CuckooTableInfo,
+    PackedCuckooBinLocation,
 };
 pub use error::{Error, Result};
 pub use oram::PathOram;

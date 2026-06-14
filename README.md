@@ -32,6 +32,8 @@ Implemented:
 - `oramctl bench-circuit` for reopening split Circuit ORAM images, running
   random reads, and optionally verifying each read against the original cuckoo
   table payload.
+- `oramctl verify-circuit-bins` and `CircuitCuckooBinReader` for validating
+  original cuckoo bin reads through packed Circuit ORAM images.
 - Fixed trace-shape tests: each logical access reads and rewrites a complete
   root-to-leaf path.
 - Circuit ORAM deterministic eviction scheduler and design notes.
@@ -247,6 +249,16 @@ Full all-level build:
   build time: 4:13.41 shell wall
   verify bench: INDEX 100/100 avg_us=9692.053,
                 CHUNK 100/100 avg_us=15353.855
+
+Long all-level online verification, 10000 reads per level:
+  cache_levels=0: INDEX 10000/10000 avg_us=3309.935,
+                  CHUNK 10000/10000 avg_us=12285.031
+  cache_levels=5: INDEX 10000/10000 avg_us=4173.953,
+                  CHUNK 10000/10000 avg_us=8688.095
+
+Bin-level ORAM reader verification, 1000 random original cuckoo bins per level:
+  INDEX 1000/1000 avg_us=6635.897
+  CHUNK 1000/1000 avg_us=10893.037
 ```
 
 Verify and benchmark the generated images against the original cuckoo tables:
@@ -263,9 +275,25 @@ cargo run --bin oramctl -- bench-circuit \
   --state-key-hex "$STATE_KEY_HEX"
 ```
 
-Omit `--db-dir` for a pure random-read benchmark without byte-for-byte
-verification. Because ORAM reads mutate image pages, use `--no-save` only for
-disposable images that you will discard or rebuild afterward.
+Verify the finer-grained cuckoo-bin reader path (`bin_id -> ORAM block -> bin
+slice`) against the original cuckoo files:
+
+```bash
+cargo run --bin oramctl -- verify-circuit-bins \
+  --oram-dir /tmp/bpir-circuit-oram \
+  --db-dir /Volumes/Bitcoin/data/checkpoints/940611 \
+  --pack 16 \
+  --bins 1000 \
+  --drain-per-access 2 \
+  --encrypted \
+  --key-hex "$KEY_HEX" \
+  --state-key-hex "$STATE_KEY_HEX"
+```
+
+For `bench-circuit`, omit `--db-dir` for a pure random-read benchmark without
+byte-for-byte verification. Because ORAM reads mutate image pages, use
+`--no-save` only for disposable images that you will discard or rebuild
+afterward.
 
 ## Prototype Warning
 
