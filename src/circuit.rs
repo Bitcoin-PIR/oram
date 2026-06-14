@@ -6,7 +6,7 @@
 //! occupancy: real accesses add a fixed amount of public eviction debt, and
 //! background work drains that debt in reverse-bit order.
 
-use crate::{ct, Error, OramBlock, OramParams, PageStore, Result};
+use crate::{ct, CircuitOramState, Error, OramBlock, OramParams, PageStore, Result};
 use rand::{CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,19 @@ impl CircuitEvictionSchedule {
         scheduled
             .checked_sub(self.completed_evictions)
             .ok_or_else(|| Error::InvalidInput("completed evictions exceed schedule".into()))
+    }
+
+    /// Check that checkpointed public counters match this ORAM tree.
+    pub fn validate_for_params(&self, params: &OramParams) -> Result<()> {
+        if self.leaf_bits != params.leaf_bits() as u32 {
+            return Err(Error::InvalidInput(format!(
+                "schedule leaf_bits {} != params leaf_bits {}",
+                self.leaf_bits,
+                params.leaf_bits()
+            )));
+        }
+        self.pending_evictions()?;
+        Ok(())
     }
 
     /// Leaf for the next deterministic eviction path, even if no debt is due.
@@ -438,6 +451,35 @@ impl<M: PageStore, P: PageStore> CircuitOram<M, P> {
         oram.pad_stash();
         oram.check_stash()?;
         Ok(oram)
+    }
+
+    /// Re-open a split-store Circuit ORAM from trusted controller state.
+    pub fn from_state(meta_store: M, payload_store: P, state: CircuitOramState) -> Result<Self> {
+        validate_circuit_stores(&state.params, &meta_store, &payload_store)?;
+        validate_circuit_state(&state.params, &state.pos_map, &state.stash, &state.schedule)?;
+        let mut oram = Self {
+            params: state.params,
+            meta_store,
+            payload_store,
+            pos_map: state.pos_map,
+            stash: state.stash,
+            rng: state.rng,
+            schedule: state.schedule,
+        };
+        oram.pad_stash();
+        oram.check_stash()?;
+        Ok(oram)
+    }
+
+    /// Snapshot the trusted Circuit ORAM controller state.
+    pub fn snapshot(&self) -> CircuitOramState {
+        CircuitOramState::new(
+            self.params.clone(),
+            self.pos_map.clone(),
+            self.stash.clone(),
+            self.rng.clone(),
+            self.schedule.clone(),
+        )
     }
 
     /// Immutable view of public ORAM parameters.
@@ -947,6 +989,43 @@ fn validate_circuit_stores(
     Ok(())
 }
 
+fn validate_circuit_state(
+    params: &OramParams,
+    pos_map: &[u32],
+    stash: &[OramBlock],
+    schedule: &CircuitEvictionSchedule,
+) -> Result<()> {
+    if pos_map.len() != params.logical_blocks {
+        return Err(Error::InvalidInput(format!(
+            "pos_map len {} != logical_blocks {}",
+            pos_map.len(),
+            params.logical_blocks
+        )));
+    }
+    for &leaf in pos_map {
+        if leaf as usize >= params.leaves {
+            return Err(Error::InvalidInput(format!("leaf {leaf} out of range")));
+        }
+    }
+    for block in stash {
+        if block.payload.len() != params.block_size {
+            return Err(Error::InvalidInput(format!(
+                "stash payload len {} != block_size {}",
+                block.payload.len(),
+                params.block_size
+            )));
+        }
+        if block.occupied && block.leaf as usize >= params.leaves {
+            return Err(Error::InvalidInput(format!(
+                "stash leaf {} out of range",
+                block.leaf
+            )));
+        }
+    }
+    schedule.validate_for_params(params)?;
+    Ok(())
+}
+
 fn zero_circuit_stores(
     params: &OramParams,
     meta_store: &mut impl PageStore,
@@ -1119,6 +1198,54 @@ mod tests {
         let new = oram.read(5).unwrap();
         assert_eq!(&new[..8], &5u64.to_le_bytes());
         assert_eq!(&new[8..16], &99u64.to_le_bytes());
+    }
+
+    #[test]
+    fn split_store_state_roundtrip_reopens_controller() {
+        let params = OramParams::with_leaves(32, 16, 32)
+            .unwrap()
+            .with_bucket_size(2)
+            .unwrap()
+            .with_stash_capacity(128)
+            .unwrap();
+        let meta_store = MemPageStore::new(
+            params.bucket_count(),
+            circuit_meta_page_bytes(params.bucket_size),
+        )
+        .unwrap();
+        let payload_store = MemPageStore::new(
+            params.bucket_count(),
+            circuit_payload_page_bytes(params.bucket_size, params.block_size),
+        )
+        .unwrap();
+        let mut oram =
+            CircuitOram::build_trusted(params, meta_store, payload_store, blocks(32, 16), [25; 32])
+                .unwrap();
+
+        assert_eq!(&oram.read(3).unwrap()[..8], &3u64.to_le_bytes());
+        assert_eq!(&oram.read(11).unwrap()[..8], &11u64.to_le_bytes());
+        assert_eq!(oram.drain_evictions(1).unwrap(), 1);
+        let pending_before_snapshot = oram.pending_evictions().unwrap();
+        assert_eq!(pending_before_snapshot, 3);
+
+        let snapshot = oram.snapshot();
+        let (meta_store, payload_store) = oram.into_stores();
+        let mut reopened = CircuitOram::from_state(meta_store, payload_store, snapshot).unwrap();
+
+        assert_eq!(
+            reopened.pending_evictions().unwrap(),
+            pending_before_snapshot
+        );
+        assert_eq!(&reopened.read(3).unwrap()[..8], &3u64.to_le_bytes());
+        assert_eq!(
+            reopened.pending_evictions().unwrap(),
+            pending_before_snapshot + 2
+        );
+        assert_eq!(
+            reopened.drain_evictions(10).unwrap(),
+            pending_before_snapshot + 2
+        );
+        assert_eq!(reopened.pending_evictions().unwrap(), 0);
     }
 
     #[test]

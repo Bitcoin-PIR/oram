@@ -35,6 +35,8 @@ Implemented:
 - Split metadata/payload `CircuitOram` controller prototype with deterministic
   delayed eviction, metadata-planned eviction placement, and fixed-shape
   page-trace tests.
+- Trusted `CircuitOramState` snapshot/reopen, including RNG state and public
+  eviction counters, with optional ChaCha20-Poly1305 state-file encryption.
 
 Intentionally not implemented yet:
 
@@ -43,7 +45,7 @@ Intentionally not implemented yet:
   deepest-first placement, then applies that plan in one fixed payload scan.
 - Recursive position map.
 - Oblivious bulk initialization.
-- Crash-safe checkpointing or WAL.
+- Crash-safe Circuit ORAM WAL / epoch protocol.
 - Release assembly / SEV-SNP ciphertext-channel audit of the constant-shape hot
   loops.
 - Multi-client sharding.
@@ -184,7 +186,8 @@ and path eviction selection now use full-slot scans plus mask-based CMOV-style
 helpers. That is an implementation hardening step, not a formal constant-time
 guarantee from Rust or LLVM.
 
-The `.state` file contains the position map, stash, and RNG state. It is trusted
-controller state. Do not write it to untrusted storage in plaintext in a real
-deployment. Use `--state-key-hex` for prototype AEAD protection; production
-should replace that key path with SEV-sealed storage.
+The `.state` file contains the position map, stash, RNG state, and, for Circuit
+ORAM, the public delayed-eviction counters. It is trusted controller state. Do
+not write it to untrusted storage in plaintext in a real deployment. Use
+`--state-key-hex` for prototype AEAD protection; production should replace that
+key path with SEV-sealed storage.

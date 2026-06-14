@@ -18,7 +18,8 @@ the next algorithmic hardening step.
 - Target `Z=2` buckets, because Circuit ORAM's deterministic eviction supports
   much lower bucket capacity than vanilla Path ORAM in practice.
 - Keep the ORAM tree outside trusted memory; trusted state should be position
-  map, fixed-capacity stash, scheduler state, and a small public top cache.
+  map, fixed-capacity stash, RNG state, scheduler state, and a small public top
+  cache.
 - Preserve BitcoinPIR's existing public KV mapping and PBC batching. ORAM is an
   oblivious array over packed cuckoo bins, not a generic map.
 - Support delayed/background eviction without secret-dependent timing.
@@ -206,6 +207,10 @@ metadata store root/version
 payload store root/version
 ```
 
+`CircuitOramState` now checkpoints the position map, fixed stash, RNG state,
+and public scheduler counters (`issued_accesses`, `completed_evictions`). It
+does not yet bind the metadata/payload stores to a root or epoch.
+
 If online reads can return before queued evictions are flushed, the checkpoint
 must be able to replay or resume the exact public eviction debt. Production
 should use a small WAL or epoch checkpoint protocol before allowing async
@@ -222,8 +227,12 @@ eviction to cross a durable boundary.
    Done as a split-store metadata-planned prototype; exact optimized
    `deepest`/`target` circuit replacement is pending.
 5. Add encrypted metadata and payload stores with fixed-shape trace tests.
-6. Add a build path from existing DPF/Harmony cuckoo tables into ORAM images.
-7. Run release assembly and SEV-SNP page-trace audit on the hot loops.
+   Partly done: split-store fixed-shape trace tests and `CircuitOramState`
+   state-file encryption are in place; metadata/payload image encryption CLI
+   wiring is still pending.
+6. Add a crash-safe WAL or epoch protocol for delayed eviction.
+7. Add a build path from existing DPF/Harmony cuckoo tables into ORAM images.
+8. Run release assembly and SEV-SNP page-trace audit on the hot loops.
 
 ## Current Design Choice
 

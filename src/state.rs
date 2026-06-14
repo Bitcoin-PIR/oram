@@ -1,4 +1,4 @@
-use crate::{Error, OramBlock, OramParams, Result};
+use crate::{CircuitEvictionSchedule, Error, OramBlock, OramParams, Result};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
@@ -15,6 +15,8 @@ use zeroize::Zeroize;
 
 const STATE_MAGIC: &[u8; 8] = b"BPORAM01";
 const SEALED_STATE_MAGIC: &[u8; 8] = b"BPORAMS1";
+const CIRCUIT_STATE_MAGIC: &[u8; 8] = b"BPCIRC01";
+const CIRCUIT_SEALED_STATE_MAGIC: &[u8; 8] = b"BPCIRCS1";
 const STATE_NONCE_LEN: usize = 12;
 
 /// Trusted controller state needed to reopen an ORAM bucket image.
@@ -150,6 +152,147 @@ impl OramState {
     }
 }
 
+/// Trusted controller state needed to reopen a split-store Circuit ORAM image.
+///
+/// This contains the position map, stash, RNG state, and public deterministic
+/// eviction counters. Treat it as TEE-private state; if written outside the TEE
+/// it must be encrypted or sealed.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CircuitOramState {
+    magic: [u8; 8],
+    /// Public ORAM sizing parameters.
+    pub params: OramParams,
+    /// Current logical-id to leaf-label position map.
+    pub pos_map: Vec<u32>,
+    /// Current fixed-capacity stash contents.
+    pub stash: Vec<OramBlock>,
+    /// Current RNG state used for future remapping.
+    pub rng: ChaCha20Rng,
+    /// Public deterministic Circuit ORAM eviction schedule.
+    pub schedule: CircuitEvictionSchedule,
+}
+
+impl CircuitOramState {
+    /// Construct a Circuit ORAM state object.
+    pub fn new(
+        params: OramParams,
+        pos_map: Vec<u32>,
+        stash: Vec<OramBlock>,
+        rng: ChaCha20Rng,
+        schedule: CircuitEvictionSchedule,
+    ) -> Self {
+        Self {
+            magic: *CIRCUIT_STATE_MAGIC,
+            params,
+            pos_map,
+            stash,
+            rng,
+            schedule,
+        }
+    }
+
+    /// Persist state atomically via temp-file-and-rename.
+    pub fn save_atomic(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let tmp = tmp_path(path);
+        {
+            let file = File::create(&tmp)?;
+            let mut writer = BufWriter::new(file);
+            bincode::serialize_into(&mut writer, self)?;
+            writer.flush()?;
+        }
+        fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    /// Persist an AEAD-encrypted Circuit ORAM state file atomically.
+    pub fn save_encrypted_atomic(&self, path: impl AsRef<Path>, key: [u8; 32]) -> Result<()> {
+        let mut plaintext = bincode::serialize(self)?;
+        let mut nonce_bytes = [0u8; STATE_NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce_bytes);
+
+        let cipher = ChaCha20Poly1305::new((&key).into());
+        let mut ciphertext = cipher.encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: &plaintext,
+                aad: CIRCUIT_SEALED_STATE_MAGIC,
+            },
+        )?;
+        plaintext.zeroize();
+
+        let mut envelope = Vec::with_capacity(
+            CIRCUIT_SEALED_STATE_MAGIC.len() + nonce_bytes.len() + ciphertext.len(),
+        );
+        envelope.extend_from_slice(CIRCUIT_SEALED_STATE_MAGIC);
+        envelope.extend_from_slice(&nonce_bytes);
+        envelope.extend_from_slice(&ciphertext);
+        ciphertext.zeroize();
+
+        let path = path.as_ref();
+        let tmp = tmp_path(path);
+        let mut writer = BufWriter::new(File::create(&tmp)?);
+        writer.write_all(&envelope)?;
+        writer.flush()?;
+        drop(writer);
+        envelope.zeroize();
+        fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    /// Load a Circuit ORAM state file.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let state: Self = bincode::deserialize_from(reader)?;
+        if &state.magic != CIRCUIT_STATE_MAGIC {
+            return Err(Error::InvalidInput(
+                "invalid Circuit ORAM state magic".into(),
+            ));
+        }
+        Ok(state)
+    }
+
+    /// Load an AEAD-encrypted Circuit ORAM state file.
+    pub fn load_encrypted(path: impl AsRef<Path>, key: [u8; 32]) -> Result<Self> {
+        let mut envelope = fs::read(path)?;
+        if envelope.len() < CIRCUIT_SEALED_STATE_MAGIC.len() + STATE_NONCE_LEN + 16 {
+            return Err(Error::InvalidInput(
+                "encrypted Circuit ORAM state file is too short".into(),
+            ));
+        }
+        if &envelope[..CIRCUIT_SEALED_STATE_MAGIC.len()] != CIRCUIT_SEALED_STATE_MAGIC {
+            return Err(Error::InvalidInput(
+                "invalid encrypted Circuit ORAM state magic".into(),
+            ));
+        }
+
+        let nonce_start = CIRCUIT_SEALED_STATE_MAGIC.len();
+        let ciphertext_start = nonce_start + STATE_NONCE_LEN;
+        let mut nonce = [0u8; STATE_NONCE_LEN];
+        nonce.copy_from_slice(&envelope[nonce_start..ciphertext_start]);
+
+        let cipher = ChaCha20Poly1305::new((&key).into());
+        let mut plaintext = cipher.decrypt(
+            Nonce::from_slice(&nonce),
+            chacha20poly1305::aead::Payload {
+                msg: &envelope[ciphertext_start..],
+                aad: CIRCUIT_SEALED_STATE_MAGIC,
+            },
+        )?;
+        envelope.zeroize();
+
+        let state: Self = bincode::deserialize(&plaintext)?;
+        plaintext.zeroize();
+        if &state.magic != CIRCUIT_STATE_MAGIC {
+            return Err(Error::InvalidInput(
+                "invalid Circuit ORAM state magic".into(),
+            ));
+        }
+        Ok(state)
+    }
+}
+
 fn tmp_path(path: &Path) -> std::path::PathBuf {
     path.with_extension(format!(
         "{}tmp",
@@ -175,6 +318,19 @@ mod tests {
         )
     }
 
+    fn sample_circuit_state() -> CircuitOramState {
+        let params = OramParams::with_leaves(4, 8, 4).unwrap();
+        let mut schedule = CircuitEvictionSchedule::new(&params);
+        schedule.record_access().unwrap();
+        CircuitOramState::new(
+            params,
+            vec![0, 1, 2, 3],
+            Vec::new(),
+            ChaCha20Rng::from_seed([4; 32]),
+            schedule,
+        )
+    }
+
     #[test]
     fn encrypted_state_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -196,5 +352,18 @@ mod tests {
             .unwrap();
 
         assert!(OramState::load_encrypted(&path, [8; 32]).is_err());
+    }
+
+    #[test]
+    fn encrypted_circuit_state_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("circuit.state");
+        let state = sample_circuit_state();
+        state.save_encrypted_atomic(&path, [7; 32]).unwrap();
+
+        let loaded = CircuitOramState::load_encrypted(&path, [7; 32]).unwrap();
+        assert_eq!(loaded.params, state.params);
+        assert_eq!(loaded.pos_map, state.pos_map);
+        assert_eq!(loaded.schedule.pending_evictions().unwrap(), 2);
     }
 }

@@ -27,6 +27,6 @@ pub use cuckoo::{CuckooOramEstimate, CuckooOramSizing, CuckooTableInfo};
 pub use error::{Error, Result};
 pub use oram::PathOram;
 pub use params::OramParams;
-pub use state::OramState;
+pub use state::{CircuitOramState, OramState};
 pub use store::{FilePageStore, FrontCachedPageStore, MemPageStore, PageStore, TracingStore};
 pub use stress::{stress_circuit, CircuitStressConfig, CircuitStressPattern, CircuitStressReport};
