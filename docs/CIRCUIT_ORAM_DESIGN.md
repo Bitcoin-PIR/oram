@@ -6,9 +6,11 @@ tables.
 
 The current `PathOram` implementation remains the correctness baseline.
 `CircuitOram` now provides a split metadata/payload controller prototype with
-the public deterministic scheduler. Its current eviction implementation is a
-greedy path eviction model; replacing that with the exact Circuit ORAM
-`deepest`/`target` metadata scans is the next algorithmic step.
+the public deterministic scheduler. Its current eviction implementation uses
+two fixed metadata scans to produce a deepest-first placement plan, then applies
+the plan with one fixed payload scan. Replacing that planning routine with the
+exact optimized `deepest`/`target` circuit from the Circuit ORAM paper remains
+the next algorithmic hardening step.
 
 ## Goals
 
@@ -113,9 +115,9 @@ Eviction phase:
 ```text
 for each due public eviction path:
   leaf = bit_reverse(completed_evictions mod leaves)
-  metadata scan 1: compute deepest candidate movement
+  metadata scan 1: collect candidate movement metadata
   metadata scan 2: compute target slot decisions
-  payload scan: move at most one block per level according to target decisions
+  payload scan: apply the target decisions
   completed_evictions += 1
 ```
 
@@ -186,8 +188,9 @@ metadata and payload page I/O per logical access
 The simulator is metadata-only. It tracks logical ids, leaf labels, bucket
 slots, stash occupancy, and public eviction debt, and it models Circuit ORAM's
 deterministic eviction schedule with greedy path eviction. This is the right
-tool for parameter exploration, but it is not a replacement for implementing
-the real `deepest`/`target` metadata scans and auditing the final page trace.
+tool for parameter exploration, but it is not a replacement for auditing the
+controller's final metadata-planned eviction trace or replacing the current
+planner with the optimized paper `deepest`/`target` circuit.
 
 ## Crash Consistency
 
@@ -216,8 +219,8 @@ eviction to cross a durable boundary.
    Partly done: the controller uses split stores; sizing still needs explicit
    split-store byte reporting.
 4. Implement a `CircuitOram` controller using the existing `PageStore` traits.
-   Done as a greedy-eviction prototype; exact `deepest`/`target` eviction is
-   pending.
+   Done as a split-store metadata-planned prototype; exact optimized
+   `deepest`/`target` circuit replacement is pending.
 5. Add encrypted metadata and payload stores with fixed-shape trace tests.
 6. Add a build path from existing DPF/Harmony cuckoo tables into ORAM images.
 7. Run release assembly and SEV-SNP page-trace audit on the hot loops.

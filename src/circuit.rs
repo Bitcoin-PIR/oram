@@ -321,6 +321,45 @@ impl CircuitPayloadBucket {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CircuitEvictionSource {
+    Path { depth: usize, slot: usize },
+    Stash { slot: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CircuitEvictionCandidate {
+    meta: CircuitMetaSlot,
+    source: CircuitEvictionSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CircuitEvictionPlacement {
+    candidate_idx: Option<usize>,
+}
+
+impl CircuitEvictionPlacement {
+    const fn dummy() -> Self {
+        Self {
+            candidate_idx: None,
+        }
+    }
+
+    const fn real(candidate_idx: usize) -> Self {
+        Self {
+            candidate_idx: Some(candidate_idx),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CircuitEvictionPlan {
+    candidates: Vec<CircuitEvictionCandidate>,
+    placements: Vec<Vec<CircuitEvictionPlacement>>,
+    selected: Vec<bool>,
+    path_candidate_indices: Vec<Vec<Option<usize>>>,
+}
+
 /// Plaintext bytes in one metadata bucket page.
 pub const fn circuit_meta_page_bytes(bucket_size: usize) -> usize {
     bucket_size * CircuitMetaSlot::SERIALIZED_LEN
@@ -548,63 +587,224 @@ impl<M: PageStore, P: PageStore> CircuitOram<M, P> {
 
     fn evict_path(&mut self, leaf: u32) -> Result<()> {
         let path = self.params.path_nodes(leaf);
-        self.read_path_into_stash(&path)?;
-        self.write_path_from_stash(&path)?;
+        let deepest_meta = self.read_path_metadata(&path)?;
+        let target_meta = self.read_path_metadata(&path)?;
+        debug_assert_eq!(deepest_meta, target_meta);
+        let plan = self.plan_eviction_placements(&path, &target_meta)?;
+        self.apply_eviction_plan(&path, &target_meta, plan)?;
         Ok(())
     }
 
-    fn read_path_into_stash(&mut self, path: &[usize]) -> Result<()> {
+    fn read_path_metadata(&mut self, path: &[usize]) -> Result<Vec<CircuitMetaBucket>> {
         let mut meta_buf = vec![0u8; circuit_meta_page_bytes(self.params.bucket_size)];
-        let mut payload_buf =
-            vec![0u8; circuit_payload_page_bytes(self.params.bucket_size, self.params.block_size)];
+        let mut buckets = Vec::with_capacity(path.len());
         for &node_idx in path {
             self.meta_store.read_page(node_idx, &mut meta_buf)?;
-            self.payload_store.read_page(node_idx, &mut payload_buf)?;
-            let meta_bucket = CircuitMetaBucket::decode(&meta_buf, self.params.bucket_size)?;
-            let payload_bucket = CircuitPayloadBucket::decode(
-                &payload_buf,
+            buckets.push(CircuitMetaBucket::decode(
+                &meta_buf,
                 self.params.bucket_size,
-                self.params.block_size,
-            )?;
-            for (slot_idx, meta) in meta_bucket.slots.iter().enumerate() {
+            )?);
+        }
+        Ok(buckets)
+    }
+
+    fn plan_eviction_placements(
+        &self,
+        path: &[usize],
+        path_meta: &[CircuitMetaBucket],
+    ) -> Result<CircuitEvictionPlan> {
+        if path.len() != self.params.height() || path_meta.len() != self.params.height() {
+            return Err(Error::InvalidInput(
+                "eviction path metadata length does not match tree height".into(),
+            ));
+        }
+
+        let mut candidates = Vec::new();
+        let mut path_candidate_indices =
+            vec![vec![None; self.params.bucket_size]; self.params.height()];
+
+        for (slot_idx, block) in self.stash.iter().enumerate() {
+            if block.occupied {
+                candidates.push(CircuitEvictionCandidate {
+                    meta: CircuitMetaSlot::real(block.logical_id, block.leaf),
+                    source: CircuitEvictionSource::Stash { slot: slot_idx },
+                });
+            }
+        }
+
+        for (depth, bucket) in path_meta.iter().enumerate() {
+            if bucket.slots.len() != self.params.bucket_size {
+                return Err(Error::InvalidInput(format!(
+                    "metadata bucket at depth {} has {} slots, expected {}",
+                    depth,
+                    bucket.slots.len(),
+                    self.params.bucket_size
+                )));
+            }
+            for (slot_idx, meta) in bucket.slots.iter().enumerate() {
                 if meta.occupied {
+                    let candidate_idx = candidates.len();
+                    candidates.push(CircuitEvictionCandidate {
+                        meta: *meta,
+                        source: CircuitEvictionSource::Path {
+                            depth,
+                            slot: slot_idx,
+                        },
+                    });
+                    path_candidate_indices[depth][slot_idx] = Some(candidate_idx);
+                }
+            }
+        }
+
+        let mut placements = vec![
+            vec![CircuitEvictionPlacement::dummy(); self.params.bucket_size];
+            self.params.height()
+        ];
+        let mut selected = vec![false; candidates.len()];
+
+        for depth in (0..self.params.height()).rev() {
+            let node_idx = path[depth];
+            for placement in &mut placements[depth] {
+                for (candidate_idx, candidate) in candidates.iter().enumerate() {
+                    if selected[candidate_idx] {
+                        continue;
+                    }
+                    if self
+                        .params
+                        .node_contains_leaf(depth, node_idx, candidate.meta.leaf)
+                    {
+                        *placement = CircuitEvictionPlacement::real(candidate_idx);
+                        selected[candidate_idx] = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(CircuitEvictionPlan {
+            candidates,
+            placements,
+            selected,
+            path_candidate_indices,
+        })
+    }
+
+    fn apply_eviction_plan(
+        &mut self,
+        path: &[usize],
+        path_meta: &[CircuitMetaBucket],
+        plan: CircuitEvictionPlan,
+    ) -> Result<()> {
+        let mut payloads = self.load_eviction_payloads(path, path_meta, &plan)?;
+        self.ensure_eviction_stash_capacity(&plan)?;
+
+        for (candidate_idx, candidate) in plan.candidates.iter().enumerate() {
+            if plan.selected[candidate_idx] {
+                if let CircuitEvictionSource::Stash { slot } = candidate.source {
+                    self.stash[slot].clear_if(1, self.params.block_size);
+                }
+            }
+        }
+
+        for (candidate_idx, candidate) in plan.candidates.iter().enumerate() {
+            if !plan.selected[candidate_idx] {
+                if let CircuitEvictionSource::Path { .. } = candidate.source {
                     self.insert_into_stash(OramBlock::real(
-                        meta.logical_id,
-                        meta.leaf,
-                        payload_bucket.slots[slot_idx].clone(),
+                        candidate.meta.logical_id,
+                        candidate.meta.leaf,
+                        std::mem::take(&mut payloads[candidate_idx]),
                         self.params.block_size,
                     )?)?;
                 }
             }
         }
-        Ok(())
-    }
 
-    fn write_path_from_stash(&mut self, path: &[usize]) -> Result<()> {
-        let mut path_by_depth = path.iter().copied().enumerate().collect::<Vec<_>>();
-        path_by_depth.reverse();
-
-        for (depth, node_idx) in path_by_depth {
+        for (depth, &node_idx) in path.iter().enumerate() {
             let mut meta_bucket = CircuitMetaBucket::dummy(self.params.bucket_size);
             let mut payload_bucket =
                 CircuitPayloadBucket::dummy(self.params.bucket_size, self.params.block_size);
-            for slot_idx in 0..self.params.bucket_size {
-                if let Some(stash_idx) = self.stash.iter().position(|block| {
-                    block.occupied && self.params.node_contains_leaf(depth, node_idx, block.leaf)
-                }) {
-                    let block = self.stash[stash_idx].clone();
-                    meta_bucket.slots[slot_idx] =
-                        CircuitMetaSlot::real(block.logical_id, block.leaf);
-                    payload_bucket.slots[slot_idx] = block.payload;
-                    self.stash[stash_idx].clear_if(1, self.params.block_size);
+            for (slot_idx, placement) in plan.placements[depth].iter().enumerate() {
+                if let Some(candidate_idx) = placement.candidate_idx {
+                    let candidate = &plan.candidates[candidate_idx];
+                    meta_bucket.slots[slot_idx] = candidate.meta;
+                    payload_bucket.slots[slot_idx] = payloads[candidate_idx].clone();
                 }
             }
+
             let encoded_meta = meta_bucket.encode(self.params.bucket_size)?;
             let encoded_payload =
                 payload_bucket.encode(self.params.bucket_size, self.params.block_size)?;
             self.meta_store.write_page(node_idx, &encoded_meta)?;
             self.payload_store.write_page(node_idx, &encoded_payload)?;
         }
+        Ok(())
+    }
+
+    fn load_eviction_payloads(
+        &mut self,
+        path: &[usize],
+        path_meta: &[CircuitMetaBucket],
+        plan: &CircuitEvictionPlan,
+    ) -> Result<Vec<Vec<u8>>> {
+        if path.len() != path_meta.len() || path.len() != plan.path_candidate_indices.len() {
+            return Err(Error::InvalidInput(
+                "eviction payload path length mismatch".into(),
+            ));
+        }
+
+        let mut payloads = vec![vec![0u8; self.params.block_size]; plan.candidates.len()];
+        for (candidate_idx, candidate) in plan.candidates.iter().enumerate() {
+            if let CircuitEvictionSource::Stash { slot } = candidate.source {
+                payloads[candidate_idx].copy_from_slice(&self.stash[slot].payload);
+            }
+        }
+
+        let mut payload_buf =
+            vec![0u8; circuit_payload_page_bytes(self.params.bucket_size, self.params.block_size)];
+        for (depth, &node_idx) in path.iter().enumerate() {
+            self.payload_store.read_page(node_idx, &mut payload_buf)?;
+            let payload_bucket = CircuitPayloadBucket::decode(
+                &payload_buf,
+                self.params.bucket_size,
+                self.params.block_size,
+            )?;
+            for (slot_idx, candidate_idx) in plan.path_candidate_indices[depth].iter().enumerate() {
+                if let Some(candidate_idx) = candidate_idx {
+                    payloads[*candidate_idx].copy_from_slice(&payload_bucket.slots[slot_idx]);
+                }
+            }
+        }
+        Ok(payloads)
+    }
+
+    fn ensure_eviction_stash_capacity(&self, plan: &CircuitEvictionPlan) -> Result<()> {
+        let mut selected_stash = 0usize;
+        let mut unselected_path = 0usize;
+
+        for (candidate_idx, candidate) in plan.candidates.iter().enumerate() {
+            match candidate.source {
+                CircuitEvictionSource::Stash { .. } => {
+                    if plan.selected[candidate_idx] {
+                        selected_stash += 1;
+                    }
+                }
+                CircuitEvictionSource::Path { .. } => {
+                    if !plan.selected[candidate_idx] {
+                        unselected_path += 1;
+                    }
+                }
+            }
+        }
+
+        let occupied = self.occupied_stash_len();
+        let free_after_selected_stash = self.params.stash_capacity - occupied + selected_stash;
+        if unselected_path > free_after_selected_stash {
+            return Err(Error::StashOverflow {
+                len: occupied - selected_stash + unselected_path,
+                capacity: self.params.stash_capacity,
+            });
+        }
+
         Ok(())
     }
 
@@ -1001,7 +1201,19 @@ mod tests {
         oram.drain_evictions(1).unwrap();
         let meta_evict = oram.meta_store.take_trace();
         let payload_evict = oram.payload_store.take_trace();
-        assert_eq!(meta_evict.len(), params.height() * 2);
+        assert_eq!(meta_evict.len(), params.height() * 3);
         assert_eq!(payload_evict.len(), params.height() * 2);
+        assert!(meta_evict[..params.height() * 2]
+            .iter()
+            .all(|event| matches!(event, TraceEvent::Read(_))));
+        assert!(meta_evict[params.height() * 2..]
+            .iter()
+            .all(|event| matches!(event, TraceEvent::Write(_))));
+        assert!(payload_evict[..params.height()]
+            .iter()
+            .all(|event| matches!(event, TraceEvent::Read(_))));
+        assert!(payload_evict[params.height()..]
+            .iter()
+            .all(|event| matches!(event, TraceEvent::Write(_))));
     }
 }

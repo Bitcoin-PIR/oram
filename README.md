@@ -33,13 +33,14 @@ Implemented:
 - `oramctl stress-circuit` metadata-only stash-pressure simulator for the
   planned Circuit ORAM controller.
 - Split metadata/payload `CircuitOram` controller prototype with deterministic
-  delayed eviction and fixed-shape page-trace tests.
+  delayed eviction, metadata-planned eviction placement, and fixed-shape
+  page-trace tests.
 
 Intentionally not implemented yet:
 
-- Exact Circuit ORAM `deepest`/`target` eviction scans. The current
-  `CircuitOram` controller uses greedy path eviction behind the same public
-  scheduler and split-store layout.
+- The exact optimized Circuit ORAM `deepest`/`target` circuit from the paper.
+  The current `CircuitOram` controller uses two fixed metadata scans to plan a
+  deepest-first placement, then applies that plan in one fixed payload scan.
 - Recursive position map.
 - Oblivious bulk initialization.
 - Crash-safe checkpointing or WAL.
@@ -170,7 +171,9 @@ The simulator stores only logical block ids, leaf labels, tree slots, and stash
 entries. It uses greedy path eviction as a stress model for Circuit ORAM's
 deterministic eviction schedule. It is useful for choosing `Z`, stash capacity,
 tree density, and public eviction-debt bounds; it is not a proof and it does
-not replace the controller trace audit.
+not replace the controller trace audit. The controller now uses a split-store
+metadata-planned eviction path; the simulator remains an intentionally cheap
+approximation for parameter sweeps.
 
 ## Prototype Warning
 
