@@ -8,7 +8,7 @@ use crate::{Error, OramBlock, OramParams, Result, AEAD_OVERHEAD};
 use std::{
     fmt,
     fs::File,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -395,6 +395,72 @@ pub struct CuckooOramEstimate {
     pub tree_slot_load_percent: f64,
 }
 
+/// Streaming reader that packs consecutive cuckoo bins into ORAM logical blocks.
+pub struct CuckooPackedBlockReader {
+    table: CuckooTableInfo,
+    bins_per_block: usize,
+    logical_blocks: usize,
+    block_payload_bytes: usize,
+    next_block: usize,
+    file: File,
+}
+
+impl CuckooPackedBlockReader {
+    /// Open a packed block reader for one DPF/Harmony cuckoo table.
+    pub fn open(table: CuckooTableInfo, bins_per_block: usize) -> Result<Self> {
+        if bins_per_block == 0 {
+            return Err(Error::InvalidInput("bins_per_block must be > 0".into()));
+        }
+        let file = File::open(&table.path)?;
+        let logical_blocks = table.total_bins().div_ceil(bins_per_block);
+        let block_payload_bytes = table.bin_size() * bins_per_block;
+        Ok(Self {
+            table,
+            bins_per_block,
+            logical_blocks,
+            block_payload_bytes,
+            next_block: 0,
+            file,
+        })
+    }
+
+    /// Number of logical ORAM blocks produced by this reader.
+    pub const fn logical_blocks(&self) -> usize {
+        self.logical_blocks
+    }
+
+    /// Fixed payload bytes in each logical ORAM block.
+    pub const fn block_payload_bytes(&self) -> usize {
+        self.block_payload_bytes
+    }
+}
+
+impl Iterator for CuckooPackedBlockReader {
+    type Item = Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_block >= self.logical_blocks {
+            return None;
+        }
+
+        let start_bin = self.next_block * self.bins_per_block;
+        let remaining_bins = self.table.total_bins() - start_bin;
+        let bins_to_read = remaining_bins.min(self.bins_per_block);
+        let bytes_to_read = bins_to_read * self.table.bin_size();
+        let offset = self.table.data_offset as u64 + (start_bin * self.table.bin_size()) as u64;
+        self.next_block += 1;
+
+        let mut payload = vec![0u8; self.block_payload_bytes];
+        if let Err(err) = self.file.seek(SeekFrom::Start(offset)) {
+            return Some(Err(err.into()));
+        }
+        if let Err(err) = self.file.read_exact(&mut payload[..bytes_to_read]) {
+            return Some(Err(err.into()));
+        }
+        Some(Ok(payload))
+    }
+}
+
 fn parse_anchor_kind(level: CuckooLevel, magic: u64) -> Result<CuckooAnchorKind> {
     let base = level.base_magic();
     if magic == base {
@@ -423,6 +489,19 @@ mod tests {
     use std::io::Write as _;
 
     fn write_sample_table(path: &Path, level: CuckooLevel, bins_per_table: u32) {
+        write_table(path, level, bins_per_table, None);
+    }
+
+    fn write_pattern_table(path: &Path, level: CuckooLevel, bins_per_table: u32) {
+        write_table(path, level, bins_per_table, Some(pattern_bin));
+    }
+
+    fn write_table(
+        path: &Path,
+        level: CuckooLevel,
+        bins_per_table: u32,
+        fill_bin: Option<fn(usize, &mut [u8])>,
+    ) {
         let k = match level {
             CuckooLevel::Index => 75u32,
             CuckooLevel::Chunk => 80u32,
@@ -441,11 +520,22 @@ mod tests {
         if level == CuckooLevel::Index {
             header[32..40].copy_from_slice(&9u64.to_le_bytes());
         }
-        let body =
-            vec![0u8; k as usize * bins_per_table as usize * slots as usize * level.slot_size()];
+        let bin_size = slots as usize * level.slot_size();
+        let total_bins = k as usize * bins_per_table as usize;
+        let mut body = vec![0u8; total_bins * bin_size];
+        if let Some(fill_bin) = fill_bin {
+            for bin_idx in 0..total_bins {
+                let start = bin_idx * bin_size;
+                fill_bin(bin_idx, &mut body[start..start + bin_size]);
+            }
+        }
         let mut file = File::create(path).unwrap();
         file.write_all(&header).unwrap();
         file.write_all(&body).unwrap();
+    }
+
+    fn pattern_bin(bin_idx: usize, out: &mut [u8]) {
+        out.fill((bin_idx % 251) as u8);
     }
 
     #[test]
@@ -488,5 +578,31 @@ mod tests {
         assert_eq!(estimate.height, 8);
         assert_eq!(estimate.cached_pages, 7);
         assert!(estimate.image_aead_bytes > estimate.image_plaintext_bytes);
+    }
+
+    #[test]
+    fn packed_block_reader_pads_final_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_CUCKOO_FILE);
+        write_pattern_table(&path, CuckooLevel::Index, 2);
+        let info = CuckooTableInfo::from_file(CuckooLevel::Index, &path).unwrap();
+        let bin_size = info.bin_size();
+        let mut reader = CuckooPackedBlockReader::open(info, 64).unwrap();
+
+        assert_eq!(reader.logical_blocks(), 3);
+        assert_eq!(reader.block_payload_bytes(), 64 * bin_size);
+
+        let first = reader.next().unwrap().unwrap();
+        assert_eq!(&first[..bin_size], vec![0u8; bin_size]);
+        assert_eq!(&first[bin_size..2 * bin_size], vec![1u8; bin_size]);
+
+        let second = reader.next().unwrap().unwrap();
+        assert_eq!(&second[..bin_size], vec![64u8; bin_size]);
+
+        let third = reader.next().unwrap().unwrap();
+        assert_eq!(&third[..bin_size], vec![128u8; bin_size]);
+        assert_eq!(&third[21 * bin_size..22 * bin_size], vec![149u8; bin_size]);
+        assert!(third[22 * bin_size..].iter().all(|&byte| byte == 0));
+        assert!(reader.next().is_none());
     }
 }

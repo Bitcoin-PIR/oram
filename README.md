@@ -27,6 +27,8 @@ Implemented:
   benchmarks.
 - `oramctl size-cuckoo` for estimating ORAM images over existing DPF/Harmony
   cuckoo tables.
+- `oramctl build-circuit` for building split metadata/payload Circuit ORAM
+  images from existing DPF/Harmony cuckoo tables.
 - Fixed trace-shape tests: each logical access reads and rewrites a complete
   root-to-leaf path.
 - Circuit ORAM deterministic eviction scheduler and design notes.
@@ -45,6 +47,8 @@ Intentionally not implemented yet:
   deepest-first placement, then applies that plan in one fixed payload scan.
 - Recursive position map.
 - Oblivious bulk initialization.
+- High-throughput bulk initialization; current Circuit ORAM build streams
+  payload blocks but still does simple per-placement page updates.
 - Crash-safe Circuit ORAM WAL / epoch protocol.
 - Release assembly / SEV-SNP ciphertext-channel audit of the constant-shape hot
   loops.
@@ -176,6 +180,42 @@ tree density, and public eviction-debt bounds; it is not a proof and it does
 not replace the controller trace audit. The controller now uses a split-store
 metadata-planned eviction path; the simulator remains an intentionally cheap
 approximation for parameter sweeps.
+
+## Circuit ORAM Build
+
+Build split metadata/payload ORAM images from an existing DPF/Harmony DB
+directory:
+
+```bash
+KEY_HEX=4242424242424242424242424242424242424242424242424242424242424242
+STATE_KEY_HEX=7373737373737373737373737373737373737373737373737373737373737373
+
+cargo run --bin oramctl -- build-circuit \
+  --db-dir /Volumes/Bitcoin/data/checkpoints/940611 \
+  --out-dir /tmp/bpir-circuit-oram \
+  --pack 16 \
+  --leaf-divisor 4 \
+  --bucket-size 2 \
+  --stash-capacity 4096 \
+  --encrypted \
+  --key-hex "$KEY_HEX" \
+  --state-key-hex "$STATE_KEY_HEX"
+```
+
+The command writes:
+
+```text
+index.meta.oram
+index.payload.oram
+index.state
+chunk.meta.oram
+chunk.payload.oram
+chunk.state
+```
+
+The builder keeps bucket metadata and trusted controller state in memory, but
+streams packed cuckoo payload blocks into the backing payload image instead of
+materializing the whole table as `Vec<Vec<u8>>`.
 
 ## Prototype Warning
 

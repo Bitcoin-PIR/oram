@@ -1,12 +1,15 @@
 use bitcoinpir_oram::{
-    stress_circuit, AeadPageStore, CircuitStressConfig, CircuitStressPattern, CircuitStressReport,
-    CuckooOramEstimate, CuckooOramSizing, CuckooTableInfo, Error, FilePageStore,
-    FrontCachedPageStore, OramParams, OramState, PageStore, PathOram, Result, AEAD_OVERHEAD,
+    circuit_meta_page_bytes, circuit_payload_page_bytes, stress_circuit, AeadPageStore,
+    CircuitOram, CircuitOramState, CircuitStressConfig, CircuitStressPattern, CircuitStressReport,
+    CuckooLevel, CuckooOramEstimate, CuckooOramSizing, CuckooPackedBlockReader, CuckooTableInfo,
+    Error, FilePageStore, FrontCachedPageStore, OramParams, OramState, PageStore, PathOram, Result,
+    AEAD_OVERHEAD,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::{
+    fs,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -109,6 +112,42 @@ enum Command {
         /// Public top ORAM tree levels cached in trusted memory.
         #[arg(long, default_value_t = 5)]
         cache_levels: usize,
+    },
+    /// Build split-store Circuit ORAM images from DPF/Harmony cuckoo tables.
+    BuildCircuit {
+        /// BitcoinPIR DB directory containing batch_pir_cuckoo.bin and chunk_pir_cuckoo.bin.
+        #[arg(long)]
+        db_dir: PathBuf,
+        /// Output directory for index/chunk metadata, payload, and state files.
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// Consecutive cuckoo bins packed into one ORAM logical block.
+        #[arg(long, default_value_t = 16)]
+        pack: usize,
+        /// Leaves = next_power_of_two(ceil(blocks / divisor)).
+        #[arg(long, default_value_t = 4)]
+        leaf_divisor: usize,
+        /// Physical blocks per Circuit ORAM bucket.
+        #[arg(long, default_value_t = 2)]
+        bucket_size: usize,
+        /// Fixed stash capacity in trusted memory.
+        #[arg(long, default_value_t = 4096)]
+        stash_capacity: usize,
+        /// Enable page AEAD for metadata and payload images.
+        #[arg(long)]
+        encrypted: bool,
+        /// 32-byte hex page encryption key. Required with --encrypted.
+        #[arg(long)]
+        key_hex: Option<String>,
+        /// 32-byte hex state encryption key. If omitted, state is written in plaintext.
+        #[arg(long)]
+        state_key_hex: Option<String>,
+        /// Cache this many public top ORAM tree levels in trusted memory during build.
+        #[arg(long, default_value_t = 0)]
+        cache_levels: usize,
+        /// 32-byte hex RNG seed. Defaults to all 0x06 for reproducible builds.
+        #[arg(long)]
+        seed_hex: Option<String>,
     },
     /// Stress-test Circuit ORAM stash pressure over DPF/Harmony cuckoo table sizes.
     StressCircuit {
@@ -305,6 +344,33 @@ fn main() -> Result<()> {
                 cache_levels,
             )?;
         }
+        Command::BuildCircuit {
+            db_dir,
+            out_dir,
+            pack,
+            leaf_divisor,
+            bucket_size,
+            stash_capacity,
+            encrypted,
+            key_hex,
+            state_key_hex,
+            cache_levels,
+            seed_hex,
+        } => {
+            build_circuit_images(
+                &db_dir,
+                &out_dir,
+                pack,
+                leaf_divisor,
+                bucket_size,
+                stash_capacity,
+                encrypted,
+                key_hex.as_deref(),
+                state_key_hex.as_deref(),
+                cache_levels,
+                parse_seed(seed_hex.as_deref(), 0x06)?,
+            )?;
+        }
         Command::StressCircuit {
             db_dirs,
             packs,
@@ -450,6 +516,179 @@ fn print_cuckoo_sizes(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_circuit_images(
+    db_dir: &Path,
+    out_dir: &Path,
+    pack: usize,
+    leaf_divisor: usize,
+    bucket_size: usize,
+    stash_capacity: usize,
+    encrypted: bool,
+    key_hex: Option<&str>,
+    state_key_hex: Option<&str>,
+    cache_levels: usize,
+    seed: [u8; 32],
+) -> Result<()> {
+    if pack == 0 {
+        return Err(Error::InvalidInput("--pack must be > 0".into()));
+    }
+    if leaf_divisor == 0 {
+        return Err(Error::InvalidInput("--leaf-divisor must be > 0".into()));
+    }
+    if encrypted {
+        parse_required_key(key_hex)?;
+    }
+    fs::create_dir_all(out_dir)?;
+
+    let tables = CuckooTableInfo::load_pair(db_dir)?;
+    println!("build_circuit=true");
+    println!("db_dir={}", db_dir.display());
+    println!("out_dir={}", out_dir.display());
+    println!("pack={pack}");
+    println!("leaf_divisor={leaf_divisor}");
+    println!("bucket_size={bucket_size}");
+    println!("stash_capacity={stash_capacity}");
+    println!("encrypted={encrypted}");
+    println!("state_encrypted={}", state_key_hex.is_some());
+    println!("cache_levels={cache_levels}");
+    println!("seed_hex={}", hex::encode(seed));
+
+    for table in &tables {
+        build_circuit_table(
+            out_dir,
+            table,
+            pack,
+            leaf_divisor,
+            bucket_size,
+            stash_capacity,
+            encrypted,
+            key_hex,
+            state_key_hex,
+            cache_levels,
+            derive_level_seed(seed, table.level),
+        )?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_circuit_table(
+    out_dir: &Path,
+    table: &CuckooTableInfo,
+    pack: usize,
+    leaf_divisor: usize,
+    bucket_size: usize,
+    stash_capacity: usize,
+    encrypted: bool,
+    key_hex: Option<&str>,
+    state_key_hex: Option<&str>,
+    cache_levels: usize,
+    seed: [u8; 32],
+) -> Result<()> {
+    let sizing = CuckooOramSizing {
+        bins_per_block: pack,
+        leaf_divisor,
+        bucket_size,
+        stash_capacity,
+        cache_levels,
+    };
+    let estimate = sizing.estimate(table)?;
+    let params = OramParams::with_leaves(
+        estimate.logical_blocks,
+        estimate.block_payload_bytes,
+        estimate.leaves,
+    )?
+    .with_bucket_size(bucket_size)?
+    .with_stash_capacity(stash_capacity)?;
+    let cached_pages = cached_pages_for_levels(&params, cache_levels)?;
+    let paths = circuit_output_paths(out_dir, table.level);
+    let (meta_store, payload_store) = open_circuit_file_stores(
+        &paths.meta_image,
+        &paths.payload_image,
+        &params,
+        encrypted,
+        key_hex,
+        cached_pages,
+        false,
+    )?;
+    let reader = CuckooPackedBlockReader::open(table.clone(), pack)?;
+    if reader.logical_blocks() != params.logical_blocks
+        || reader.block_payload_bytes() != params.block_size
+    {
+        return Err(Error::InvalidInput(
+            "packed cuckoo reader dimensions do not match ORAM params".into(),
+        ));
+    }
+
+    let started = Instant::now();
+    let mut oram = CircuitOram::build_trusted_from_iter(
+        params.clone(),
+        meta_store,
+        payload_store,
+        reader,
+        seed,
+    )?;
+    oram.flush()?;
+    save_circuit_state(&oram.snapshot(), &paths.state, state_key_hex)?;
+    let elapsed = started.elapsed();
+
+    println!(
+        "built level={} source={} meta_image={} payload_image={} state={} total_bins={} logical_blocks={} block_payload_bytes={} bucket_size={} leaves={} height={} bucket_pages={} cached_pages={} meta_page_plaintext_bytes={} payload_page_plaintext_bytes={} meta_image_bytes={} payload_image_bytes={} stash_len={} pending_evictions={} elapsed_ms={}",
+        table.level,
+        table.path.display(),
+        paths.meta_image.display(),
+        paths.payload_image.display(),
+        paths.state.display(),
+        estimate.total_bins,
+        params.logical_blocks,
+        params.block_size,
+        params.bucket_size,
+        params.leaves,
+        params.height(),
+        params.bucket_count(),
+        cached_pages,
+        circuit_meta_page_bytes(params.bucket_size),
+        circuit_payload_page_bytes(params.bucket_size, params.block_size),
+        params.bucket_count() as u64
+            * backing_page_bytes(circuit_meta_page_bytes(params.bucket_size), encrypted) as u64,
+        params.bucket_count() as u64
+            * backing_page_bytes(
+                circuit_payload_page_bytes(params.bucket_size, params.block_size),
+                encrypted
+            ) as u64,
+        oram.stash_len(),
+        oram.pending_evictions()?,
+        elapsed.as_millis()
+    );
+
+    Ok(())
+}
+
+struct CircuitOutputPaths {
+    meta_image: PathBuf,
+    payload_image: PathBuf,
+    state: PathBuf,
+}
+
+fn circuit_output_paths(out_dir: &Path, level: CuckooLevel) -> CircuitOutputPaths {
+    let label = level.label();
+    CircuitOutputPaths {
+        meta_image: out_dir.join(format!("{label}.meta.oram")),
+        payload_image: out_dir.join(format!("{label}.payload.oram")),
+        state: out_dir.join(format!("{label}.state")),
+    }
+}
+
+fn derive_level_seed(mut seed: [u8; 32], level: CuckooLevel) -> [u8; 32] {
+    seed[31] ^= match level {
+        CuckooLevel::Index => 0x11,
+        CuckooLevel::Chunk => 0x22,
+    };
+    seed
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -646,9 +885,72 @@ fn save_state(state: &OramState, path: &Path, state_key_hex: Option<&str>) -> Re
     }
 }
 
+fn save_circuit_state(
+    state: &CircuitOramState,
+    path: &Path,
+    state_key_hex: Option<&str>,
+) -> Result<()> {
+    match state_key_hex {
+        Some(key_hex) => state.save_encrypted_atomic(path, parse_32_hex(key_hex)?),
+        None => state.save_atomic(path),
+    }
+}
+
 fn open_file_store(
     image: &Path,
     params: &OramParams,
+    encrypted: bool,
+    key_hex: Option<&str>,
+    cached_pages: usize,
+    load_cached_pages: bool,
+) -> Result<Box<dyn PageStore>> {
+    open_sized_file_store(
+        image,
+        params.bucket_count(),
+        params.bucket_bytes(),
+        encrypted,
+        key_hex,
+        cached_pages,
+        load_cached_pages,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_circuit_file_stores(
+    meta_image: &Path,
+    payload_image: &Path,
+    params: &OramParams,
+    encrypted: bool,
+    key_hex: Option<&str>,
+    cached_pages: usize,
+    load_cached_pages: bool,
+) -> Result<(Box<dyn PageStore>, Box<dyn PageStore>)> {
+    let meta_store = open_sized_file_store(
+        meta_image,
+        params.bucket_count(),
+        circuit_meta_page_bytes(params.bucket_size),
+        encrypted,
+        key_hex,
+        cached_pages,
+        load_cached_pages,
+    )?;
+    let payload_store = open_sized_file_store(
+        payload_image,
+        params.bucket_count(),
+        circuit_payload_page_bytes(params.bucket_size, params.block_size),
+        encrypted,
+        key_hex,
+        cached_pages,
+        load_cached_pages,
+    )?;
+    Ok((meta_store, payload_store))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_sized_file_store(
+    image: &Path,
+    page_count: usize,
+    plaintext_page_size: usize,
     encrypted: bool,
     key_hex: Option<&str>,
     cached_pages: usize,
@@ -658,16 +960,12 @@ fn open_file_store(
         let key = parse_required_key(key_hex)?;
         let file = FilePageStore::open(
             image,
-            params.bucket_count(),
-            params.bucket_bytes() + AEAD_OVERHEAD,
+            page_count,
+            backing_page_bytes(plaintext_page_size, true),
         )?;
-        Box::new(AeadPageStore::new(file, key, params.bucket_bytes())?)
+        Box::new(AeadPageStore::new(file, key, plaintext_page_size)?)
     } else {
-        Box::new(FilePageStore::open(
-            image,
-            params.bucket_count(),
-            params.bucket_bytes(),
-        )?)
+        Box::new(FilePageStore::open(image, page_count, plaintext_page_size)?)
     };
 
     if cached_pages == 0 {
@@ -680,6 +978,10 @@ fn open_file_store(
             cached_pages,
         )?))
     }
+}
+
+fn backing_page_bytes(plaintext_page_size: usize, encrypted: bool) -> usize {
+    plaintext_page_size + if encrypted { AEAD_OVERHEAD } else { 0 }
 }
 
 fn cached_pages_for_levels(params: &OramParams, cache_levels: usize) -> Result<usize> {
