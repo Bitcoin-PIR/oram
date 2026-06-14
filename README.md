@@ -228,11 +228,26 @@ metadata, then write every metadata page and every payload page exactly once in
 page order. Cuckoo payload source reads are mmap-backed, so bucket-order payload
 assembly does not issue one `seek`/`read` syscall pair per logical block.
 
-On a real `940611` snapshot INDEX build with `pack=16`, `leaf_divisor=4`,
-`Z=2`, encrypted pages, and `cache_levels=0`, this path built
-`index.meta.oram` + `index.payload.oram` + `index.state` in `33645 ms`
-(`34.054s` shell wall time). A 100-op verification benchmark against the
-original cuckoo table verified `100/100` reads with `avg_us=6333.697`.
+Current real `940611` snapshot baseline with `pack=16`, `leaf_divisor=4`,
+`Z=2`, encrypted pages, and `cache_levels=0`:
+
+```text
+INDEX-only build:
+  image/state: 108 MiB metadata + 3.3 GiB payload + 13 MiB state
+  build time: 33645 ms (34.054s shell wall)
+  verify bench: 100/100 reads, avg_us=6333.697
+
+CHUNK-only build:
+  image/state: 216 MiB metadata + 17 GiB payload + 29 MiB state
+  build time: 168803 ms (2:48.99 shell wall)
+  verify bench: 100/100 reads, avg_us=10520.597
+
+Full all-level build:
+  image/state: 20 GiB total directory
+  build time: 4:13.41 shell wall
+  verify bench: INDEX 100/100 avg_us=9692.053,
+                CHUNK 100/100 avg_us=15353.855
+```
 
 Verify and benchmark the generated images against the original cuckoo tables:
 
