@@ -4,10 +4,11 @@ This document fixes the next ORAM backend direction for BitcoinPIR: a
 disk-backed Circuit ORAM controller tuned for the existing DPF/Harmony cuckoo
 tables.
 
-The current `PathOram` implementation remains the correctness baseline. The
-Circuit ORAM work should reuse its page-store, AEAD page, fixed stash, and
-cuckoo sizing code, but change the tree maintenance algorithm and storage
-layout.
+The current `PathOram` implementation remains the correctness baseline.
+`CircuitOram` now provides a split metadata/payload controller prototype with
+the public deterministic scheduler. Its current eviction implementation is a
+greedy path eviction model; replacing that with the exact Circuit ORAM
+`deepest`/`target` metadata scans is the next algorithmic step.
 
 ## Goals
 
@@ -212,7 +213,11 @@ eviction to cross a durable boundary.
 1. Add deterministic Circuit ORAM scheduler and tests. Done.
 2. Add `oramctl stress-circuit` simulator over real cuckoo table sizes. Done.
 3. Split metadata/payload page models in the simulator and sizing output.
+   Partly done: the controller uses split stores; sizing still needs explicit
+   split-store byte reporting.
 4. Implement a `CircuitOram` controller using the existing `PageStore` traits.
+   Done as a greedy-eviction prototype; exact `deepest`/`target` eviction is
+   pending.
 5. Add encrypted metadata and payload stores with fixed-shape trace tests.
 6. Add a build path from existing DPF/Harmony cuckoo tables into ORAM images.
 7. Run release assembly and SEV-SNP page-trace audit on the hot loops.

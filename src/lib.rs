@@ -19,7 +19,10 @@ pub mod stress;
 
 pub use aead::{AeadPageStore, AEAD_OVERHEAD};
 pub use block::{Bucket, OramBlock};
-pub use circuit::CircuitEvictionSchedule;
+pub use circuit::{
+    circuit_meta_page_bytes, circuit_payload_page_bytes, CircuitEvictionSchedule, CircuitMetaSlot,
+    CircuitOram,
+};
 pub use cuckoo::{CuckooOramEstimate, CuckooOramSizing, CuckooTableInfo};
 pub use error::{Error, Result};
 pub use oram::PathOram;

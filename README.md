@@ -32,10 +32,14 @@ Implemented:
 - Circuit ORAM deterministic eviction scheduler and design notes.
 - `oramctl stress-circuit` metadata-only stash-pressure simulator for the
   planned Circuit ORAM controller.
+- Split metadata/payload `CircuitOram` controller prototype with deterministic
+  delayed eviction and fixed-shape page-trace tests.
 
 Intentionally not implemented yet:
 
-- Circuit ORAM controller.
+- Exact Circuit ORAM `deepest`/`target` eviction scans. The current
+  `CircuitOram` controller uses greedy path eviction behind the same public
+  scheduler and split-store layout.
 - Recursive position map.
 - Oblivious bulk initialization.
 - Crash-safe checkpointing or WAL.
