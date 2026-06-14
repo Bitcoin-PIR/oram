@@ -196,6 +196,7 @@ STATE_KEY_HEX=7373737373737373737373737373737373737373737373737373737373737373
 cargo run --bin oramctl -- build-circuit \
   --db-dir /Volumes/Bitcoin/data/checkpoints/940611 \
   --out-dir /tmp/bpir-circuit-oram \
+  --level all \
   --pack 16 \
   --leaf-divisor 4 \
   --bucket-size 2 \
@@ -216,6 +217,9 @@ chunk.payload.oram
 chunk.state
 ```
 
+Use `--level index` or `--level chunk` for a one-level trial before building
+both images.
+
 The builder keeps bucket metadata and trusted controller state in memory, but
 streams packed cuckoo payload blocks into the backing payload image instead of
 materializing the whole table as `Vec<Vec<u8>>`.
@@ -235,8 +239,8 @@ cargo run --bin oramctl -- bench-circuit \
 ```
 
 Omit `--db-dir` for a pure random-read benchmark without byte-for-byte
-verification. Use `--no-save` when you do not want the benchmark to persist the
-updated trusted state.
+verification. Because ORAM reads mutate image pages, use `--no-save` only for
+disposable images that you will discard or rebuild afterward.
 
 ## Prototype Warning
 

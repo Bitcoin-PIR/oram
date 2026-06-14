@@ -88,7 +88,7 @@ enum Command {
         /// 32-byte hex query RNG seed. Defaults to all 0x03.
         #[arg(long)]
         query_seed_hex: Option<String>,
-        /// Do not write back the updated trusted state.
+        /// Do not write back state. ORAM reads still mutate image pages; use only for disposable images.
         #[arg(long)]
         no_save: bool,
     },
@@ -121,6 +121,9 @@ enum Command {
         /// Output directory for index/chunk metadata, payload, and state files.
         #[arg(long)]
         out_dir: PathBuf,
+        /// Which Circuit ORAM instance to build.
+        #[arg(long, value_enum, default_value_t = LevelArg::All)]
+        level: LevelArg,
         /// Consecutive cuckoo bins packed into one ORAM logical block.
         #[arg(long, default_value_t = 16)]
         pack: usize,
@@ -184,7 +187,7 @@ enum Command {
         /// 32-byte hex query RNG seed. Defaults to all 0x04.
         #[arg(long)]
         query_seed_hex: Option<String>,
-        /// Do not write back the updated trusted state.
+        /// Do not write back state. ORAM reads still mutate image pages; use only for disposable images.
         #[arg(long)]
         no_save: bool,
     },
@@ -403,6 +406,7 @@ fn main() -> Result<()> {
         Command::BuildCircuit {
             db_dir,
             out_dir,
+            level,
             pack,
             leaf_divisor,
             bucket_size,
@@ -416,6 +420,7 @@ fn main() -> Result<()> {
             build_circuit_images(
                 &db_dir,
                 &out_dir,
+                level,
                 pack,
                 leaf_divisor,
                 bucket_size,
@@ -607,6 +612,7 @@ fn print_cuckoo_sizes(
 fn build_circuit_images(
     db_dir: &Path,
     out_dir: &Path,
+    level: LevelArg,
     pack: usize,
     leaf_divisor: usize,
     bucket_size: usize,
@@ -632,6 +638,7 @@ fn build_circuit_images(
     println!("build_circuit=true");
     println!("db_dir={}", db_dir.display());
     println!("out_dir={}", out_dir.display());
+    println!("level={level:?}");
     println!("pack={pack}");
     println!("leaf_divisor={leaf_divisor}");
     println!("bucket_size={bucket_size}");
@@ -641,7 +648,11 @@ fn build_circuit_images(
     println!("cache_levels={cache_levels}");
     println!("seed_hex={}", hex::encode(seed));
 
-    for table in &tables {
+    for &selected_level in level.levels() {
+        let table = tables
+            .iter()
+            .find(|table| table.level == selected_level)
+            .expect("load_pair returns both levels");
         build_circuit_table(
             out_dir,
             table,
