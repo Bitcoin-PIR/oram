@@ -233,7 +233,9 @@ eviction to cross a durable boundary.
 6. Add a crash-safe WAL or epoch protocol for delayed eviction.
 7. Add a build path from existing DPF/Harmony cuckoo tables into ORAM images.
    Done for trusted/offline initialization via `oramctl build-circuit`.
-   High-throughput bulk placement and final manifest wiring are still pending.
+   `oramctl bench-circuit --db-dir ...` reopens the split images and verifies
+   random reads against the original packed cuckoo payload. High-throughput
+   bulk placement and final manifest wiring are still pending.
 8. Run release assembly and SEV-SNP page-trace audit on the hot loops.
 
 ## Current Design Choice

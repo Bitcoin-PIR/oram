@@ -149,6 +149,45 @@ enum Command {
         #[arg(long)]
         seed_hex: Option<String>,
     },
+    /// Run random reads against split-store Circuit ORAM images.
+    BenchCircuit {
+        /// ORAM image directory containing index/chunk metadata, payload, and state files.
+        #[arg(long)]
+        oram_dir: PathBuf,
+        /// Optional BitcoinPIR DB directory for byte-for-byte read verification.
+        #[arg(long)]
+        db_dir: Option<PathBuf>,
+        /// Which Circuit ORAM instance to benchmark.
+        #[arg(long, value_enum, default_value_t = LevelArg::All)]
+        level: LevelArg,
+        /// Consecutive cuckoo bins packed into one ORAM logical block.
+        #[arg(long, default_value_t = 16)]
+        pack: usize,
+        /// Number of random reads per selected level.
+        #[arg(long, default_value_t = 1000)]
+        ops: usize,
+        /// Public eviction paths drained after each read.
+        #[arg(long, default_value_t = 2)]
+        drain_per_access: u64,
+        /// Enable page AEAD for metadata and payload images.
+        #[arg(long)]
+        encrypted: bool,
+        /// 32-byte hex page encryption key. Required with --encrypted.
+        #[arg(long)]
+        key_hex: Option<String>,
+        /// 32-byte hex state encryption key. Required if state was encrypted.
+        #[arg(long)]
+        state_key_hex: Option<String>,
+        /// Cache this many public top ORAM tree levels in trusted memory.
+        #[arg(long, default_value_t = 0)]
+        cache_levels: usize,
+        /// 32-byte hex query RNG seed. Defaults to all 0x04.
+        #[arg(long)]
+        query_seed_hex: Option<String>,
+        /// Do not write back the updated trusted state.
+        #[arg(long)]
+        no_save: bool,
+    },
     /// Stress-test Circuit ORAM stash pressure over DPF/Harmony cuckoo table sizes.
     StressCircuit {
         /// BitcoinPIR DB directory containing batch_pir_cuckoo.bin and chunk_pir_cuckoo.bin.
@@ -197,6 +236,23 @@ enum Command {
 enum StressPatternArg {
     Random,
     RoundRobin,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LevelArg {
+    All,
+    Index,
+    Chunk,
+}
+
+impl LevelArg {
+    const fn levels(self) -> &'static [CuckooLevel] {
+        match self {
+            Self::All => &[CuckooLevel::Index, CuckooLevel::Chunk],
+            Self::Index => &[CuckooLevel::Index],
+            Self::Chunk => &[CuckooLevel::Chunk],
+        }
+    }
 }
 
 impl From<StressPatternArg> for CircuitStressPattern {
@@ -369,6 +425,35 @@ fn main() -> Result<()> {
                 state_key_hex.as_deref(),
                 cache_levels,
                 parse_seed(seed_hex.as_deref(), 0x06)?,
+            )?;
+        }
+        Command::BenchCircuit {
+            oram_dir,
+            db_dir,
+            level,
+            pack,
+            ops,
+            drain_per_access,
+            encrypted,
+            key_hex,
+            state_key_hex,
+            cache_levels,
+            query_seed_hex,
+            no_save,
+        } => {
+            bench_circuit_images(
+                &oram_dir,
+                db_dir.as_deref(),
+                level,
+                pack,
+                ops,
+                drain_per_access,
+                encrypted,
+                key_hex.as_deref(),
+                state_key_hex.as_deref(),
+                cache_levels,
+                parse_seed(query_seed_hex.as_deref(), 0x04)?,
+                no_save,
             )?;
         }
         Command::StressCircuit {
@@ -692,6 +777,171 @@ fn derive_level_seed(mut seed: [u8; 32], level: CuckooLevel) -> [u8; 32] {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn bench_circuit_images(
+    oram_dir: &Path,
+    db_dir: Option<&Path>,
+    level: LevelArg,
+    pack: usize,
+    ops: usize,
+    drain_per_access: u64,
+    encrypted: bool,
+    key_hex: Option<&str>,
+    state_key_hex: Option<&str>,
+    cache_levels: usize,
+    query_seed: [u8; 32],
+    no_save: bool,
+) -> Result<()> {
+    if pack == 0 {
+        return Err(Error::InvalidInput("--pack must be > 0".into()));
+    }
+    if encrypted {
+        parse_required_key(key_hex)?;
+    }
+    let tables = match db_dir {
+        Some(db_dir) => Some(CuckooTableInfo::load_pair(db_dir)?),
+        None => None,
+    };
+
+    println!("bench_circuit=true");
+    println!("oram_dir={}", oram_dir.display());
+    println!(
+        "db_dir={}",
+        db_dir
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+    println!("level={level:?}");
+    println!("pack={pack}");
+    println!("ops={ops}");
+    println!("drain_per_access={drain_per_access}");
+    println!("encrypted={encrypted}");
+    println!("state_encrypted={}", state_key_hex.is_some());
+    println!("cache_levels={cache_levels}");
+    println!("query_seed_hex={}", hex::encode(query_seed));
+    println!("no_save={no_save}");
+
+    for &selected_level in level.levels() {
+        let table = tables
+            .as_ref()
+            .and_then(|tables| tables.iter().find(|table| table.level == selected_level));
+        bench_circuit_table(
+            oram_dir,
+            selected_level,
+            table,
+            pack,
+            ops,
+            drain_per_access,
+            encrypted,
+            key_hex,
+            state_key_hex,
+            cache_levels,
+            derive_level_seed(query_seed, selected_level),
+            no_save,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bench_circuit_table(
+    oram_dir: &Path,
+    level: CuckooLevel,
+    table: Option<&CuckooTableInfo>,
+    pack: usize,
+    ops: usize,
+    drain_per_access: u64,
+    encrypted: bool,
+    key_hex: Option<&str>,
+    state_key_hex: Option<&str>,
+    cache_levels: usize,
+    query_seed: [u8; 32],
+    no_save: bool,
+) -> Result<()> {
+    let paths = circuit_output_paths(oram_dir, level);
+    let loaded = load_circuit_state(&paths.state, state_key_hex)?;
+    let params = loaded.params.clone();
+    let cached_pages = cached_pages_for_levels(&params, cache_levels)?;
+    let (meta_store, payload_store) = open_circuit_file_stores(
+        &paths.meta_image,
+        &paths.payload_image,
+        &params,
+        encrypted,
+        key_hex,
+        cached_pages,
+        true,
+    )?;
+    let mut oram = CircuitOram::from_state(meta_store, payload_store, loaded)?;
+    let mut verifier = match table {
+        Some(table) => {
+            let reader = CuckooPackedBlockReader::open(table.clone(), pack)?;
+            if reader.logical_blocks() != params.logical_blocks
+                || reader.block_payload_bytes() != params.block_size
+            {
+                return Err(Error::InvalidInput(format!(
+                    "{} verifier dimensions do not match Circuit ORAM state",
+                    level
+                )));
+            }
+            Some(reader)
+        }
+        None => None,
+    };
+    let mut query_rng = ChaCha20Rng::from_seed(query_seed);
+    let pending_before = oram.pending_evictions()?;
+
+    let started = Instant::now();
+    let mut checksum = 0u64;
+    let mut verified = 0usize;
+    let mut drained = 0u64;
+    for _ in 0..ops {
+        let logical_id = query_rng.next_u64() % params.logical_blocks as u64;
+        let payload = oram.read(logical_id)?;
+        checksum = checksum_payload(checksum, &payload);
+        if let Some(verifier) = verifier.as_mut() {
+            let expected = verifier.read_block(logical_id as usize)?;
+            if payload != expected {
+                return Err(Error::InvalidInput(format!(
+                    "{} logical block {} did not match original cuckoo payload",
+                    level, logical_id
+                )));
+            }
+            verified += 1;
+        }
+        drained += oram.drain_evictions(drain_per_access)?;
+    }
+    let elapsed = started.elapsed();
+    oram.flush()?;
+    if !no_save {
+        save_circuit_state(&oram.snapshot(), &paths.state, state_key_hex)?;
+    }
+
+    println!(
+        "bench level={} meta_image={} payload_image={} state={} ops={} verified={} logical_blocks={} block_payload_bytes={} leaves={} height={} cached_pages={} stash_len={} pending_before={} pending_after={} drained_evictions={} elapsed_ms={} avg_us={:.3} checksum={}",
+        level,
+        paths.meta_image.display(),
+        paths.payload_image.display(),
+        paths.state.display(),
+        ops,
+        verified,
+        params.logical_blocks,
+        params.block_size,
+        params.leaves,
+        params.height(),
+        cached_pages,
+        oram.stash_len(),
+        pending_before,
+        oram.pending_evictions()?,
+        drained,
+        elapsed.as_millis(),
+        elapsed.as_secs_f64() * 1_000_000.0 / ops.max(1) as f64,
+        checksum,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn print_circuit_stress(
     db_dirs: &[PathBuf],
     packs: &[usize],
@@ -878,6 +1128,13 @@ fn load_state(path: &Path, state_key_hex: Option<&str>) -> Result<OramState> {
     }
 }
 
+fn load_circuit_state(path: &Path, state_key_hex: Option<&str>) -> Result<CircuitOramState> {
+    match state_key_hex {
+        Some(key_hex) => CircuitOramState::load_encrypted(path, parse_32_hex(key_hex)?),
+        None => CircuitOramState::load(path),
+    }
+}
+
 fn save_state(state: &OramState, path: &Path, state_key_hex: Option<&str>) -> Result<()> {
     match state_key_hex {
         Some(key_hex) => state.save_encrypted_atomic(path, parse_32_hex(key_hex)?),
@@ -1033,4 +1290,13 @@ fn deterministic_payloads(blocks: usize, block_size: usize) -> Vec<Vec<u8>> {
             payload
         })
         .collect()
+}
+
+fn checksum_payload(mut checksum: u64, payload: &[u8]) -> u64 {
+    for chunk in payload.chunks(8) {
+        let mut buf = [0u8; 8];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        checksum = checksum.rotate_left(5) ^ u64::from_le_bytes(buf);
+    }
+    checksum
 }

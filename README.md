@@ -29,6 +29,9 @@ Implemented:
   cuckoo tables.
 - `oramctl build-circuit` for building split metadata/payload Circuit ORAM
   images from existing DPF/Harmony cuckoo tables.
+- `oramctl bench-circuit` for reopening split Circuit ORAM images, running
+  random reads, and optionally verifying each read against the original cuckoo
+  table payload.
 - Fixed trace-shape tests: each logical access reads and rewrites a complete
   root-to-leaf path.
 - Circuit ORAM deterministic eviction scheduler and design notes.
@@ -216,6 +219,24 @@ chunk.state
 The builder keeps bucket metadata and trusted controller state in memory, but
 streams packed cuckoo payload blocks into the backing payload image instead of
 materializing the whole table as `Vec<Vec<u8>>`.
+
+Verify and benchmark the generated images against the original cuckoo tables:
+
+```bash
+cargo run --bin oramctl -- bench-circuit \
+  --oram-dir /tmp/bpir-circuit-oram \
+  --db-dir /Volumes/Bitcoin/data/checkpoints/940611 \
+  --pack 16 \
+  --ops 1000 \
+  --drain-per-access 2 \
+  --encrypted \
+  --key-hex "$KEY_HEX" \
+  --state-key-hex "$STATE_KEY_HEX"
+```
+
+Omit `--db-dir` for a pure random-read benchmark without byte-for-byte
+verification. Use `--no-save` when you do not want the benchmark to persist the
+updated trusted state.
 
 ## Prototype Warning
 

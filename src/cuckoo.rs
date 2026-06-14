@@ -433,6 +433,26 @@ impl CuckooPackedBlockReader {
     pub const fn block_payload_bytes(&self) -> usize {
         self.block_payload_bytes
     }
+
+    /// Read one packed logical block without changing iterator progress.
+    pub fn read_block(&mut self, logical_block: usize) -> Result<Vec<u8>> {
+        if logical_block >= self.logical_blocks {
+            return Err(Error::InvalidInput(format!(
+                "logical block {} out of range {}",
+                logical_block, self.logical_blocks
+            )));
+        }
+
+        let start_bin = logical_block * self.bins_per_block;
+        let remaining_bins = self.table.total_bins() - start_bin;
+        let bins_to_read = remaining_bins.min(self.bins_per_block);
+        let bytes_to_read = bins_to_read * self.table.bin_size();
+        let offset = self.table.data_offset as u64 + (start_bin * self.table.bin_size()) as u64;
+        let mut payload = vec![0u8; self.block_payload_bytes];
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(&mut payload[..bytes_to_read])?;
+        Ok(payload)
+    }
 }
 
 impl Iterator for CuckooPackedBlockReader {
@@ -443,21 +463,9 @@ impl Iterator for CuckooPackedBlockReader {
             return None;
         }
 
-        let start_bin = self.next_block * self.bins_per_block;
-        let remaining_bins = self.table.total_bins() - start_bin;
-        let bins_to_read = remaining_bins.min(self.bins_per_block);
-        let bytes_to_read = bins_to_read * self.table.bin_size();
-        let offset = self.table.data_offset as u64 + (start_bin * self.table.bin_size()) as u64;
+        let block_idx = self.next_block;
         self.next_block += 1;
-
-        let mut payload = vec![0u8; self.block_payload_bytes];
-        if let Err(err) = self.file.seek(SeekFrom::Start(offset)) {
-            return Some(Err(err.into()));
-        }
-        if let Err(err) = self.file.read_exact(&mut payload[..bytes_to_read]) {
-            return Some(Err(err.into()));
-        }
-        Some(Ok(payload))
+        Some(self.read_block(block_idx))
     }
 }
 
@@ -604,5 +612,21 @@ mod tests {
         assert_eq!(&third[21 * bin_size..22 * bin_size], vec![149u8; bin_size]);
         assert!(third[22 * bin_size..].iter().all(|&byte| byte == 0));
         assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn packed_block_random_read_does_not_advance_iterator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CHUNK_CUCKOO_FILE);
+        write_pattern_table(&path, CuckooLevel::Chunk, 2);
+        let info = CuckooTableInfo::from_file(CuckooLevel::Chunk, &path).unwrap();
+        let bin_size = info.bin_size();
+        let mut reader = CuckooPackedBlockReader::open(info, 10).unwrap();
+
+        let random = reader.read_block(2).unwrap();
+        assert_eq!(&random[..bin_size], vec![20u8; bin_size]);
+
+        let first = reader.next().unwrap().unwrap();
+        assert_eq!(&first[..bin_size], vec![0u8; bin_size]);
     }
 }
