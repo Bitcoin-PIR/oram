@@ -1,6 +1,6 @@
 # BitcoinPIR ORAM
 
-BitcoinPIR-shaped disk-backed Path ORAM prototype.
+BitcoinPIR-shaped disk-backed ORAM prototype.
 
 This repository is intentionally **not** a generic oblivious map. BitcoinPIR
 already owns the public mapping from `scripthash` to PBC/cuckoo positions; this
@@ -29,9 +29,12 @@ Implemented:
   cuckoo tables.
 - Fixed trace-shape tests: each logical access reads and rewrites a complete
   root-to-leaf path.
+- Circuit ORAM deterministic eviction scheduler and design notes.
 
 Intentionally not implemented yet:
 
+- Circuit ORAM controller.
+- Circuit ORAM stash-pressure simulator.
 - Recursive position map.
 - Oblivious bulk initialization.
 - Crash-safe checkpointing or WAL.
@@ -61,6 +64,10 @@ Each access:
 4. Rewrites every bucket on the same path from the stash.
 
 The backing store sees random ORAM paths, not BitcoinPIR logical ids.
+
+The planned production direction is Circuit ORAM with deterministic delayed
+eviction, `Z=2`, and packed DPF/Harmony cuckoo bins. See
+[`docs/CIRCUIT_ORAM_DESIGN.md`](docs/CIRCUIT_ORAM_DESIGN.md).
 
 ## Build
 

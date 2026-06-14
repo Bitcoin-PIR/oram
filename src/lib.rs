@@ -7,6 +7,7 @@
 
 pub mod aead;
 pub mod block;
+pub mod circuit;
 pub mod ct;
 pub mod cuckoo;
 pub mod error;
@@ -17,6 +18,7 @@ pub mod store;
 
 pub use aead::{AeadPageStore, AEAD_OVERHEAD};
 pub use block::{Bucket, OramBlock};
+pub use circuit::CircuitEvictionSchedule;
 pub use cuckoo::{CuckooOramEstimate, CuckooOramSizing, CuckooTableInfo};
 pub use error::{Error, Result};
 pub use oram::PathOram;
