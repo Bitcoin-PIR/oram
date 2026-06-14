@@ -4,11 +4,12 @@
 //! the ORAM adapter. OnionPIR artifacts have a different encoding and are out
 //! of scope for this crate.
 
-use crate::{Error, OramBlock, OramParams, Result, AEAD_OVERHEAD};
+use crate::{Error, OramBlock, OramParams, Result, TrustedBlockSource, AEAD_OVERHEAD};
+use memmap2::{Mmap, MmapOptions};
 use std::{
     fmt,
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -402,7 +403,7 @@ pub struct CuckooPackedBlockReader {
     logical_blocks: usize,
     block_payload_bytes: usize,
     next_block: usize,
-    file: File,
+    mmap: Mmap,
 }
 
 impl CuckooPackedBlockReader {
@@ -412,6 +413,10 @@ impl CuckooPackedBlockReader {
             return Err(Error::InvalidInput("bins_per_block must be > 0".into()));
         }
         let file = File::open(&table.path)?;
+        // SAFETY: the table file is opened read-only and this process never
+        // mutates it while the reader is alive. The parsed header validated the
+        // file length before we create slices from the mapping.
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
         let logical_blocks = table.total_bins().div_ceil(bins_per_block);
         let block_payload_bytes = table.bin_size() * bins_per_block;
         Ok(Self {
@@ -420,7 +425,7 @@ impl CuckooPackedBlockReader {
             logical_blocks,
             block_payload_bytes,
             next_block: 0,
-            file,
+            mmap,
         })
     }
 
@@ -447,10 +452,18 @@ impl CuckooPackedBlockReader {
         let remaining_bins = self.table.total_bins() - start_bin;
         let bins_to_read = remaining_bins.min(self.bins_per_block);
         let bytes_to_read = bins_to_read * self.table.bin_size();
-        let offset = self.table.data_offset as u64 + (start_bin * self.table.bin_size()) as u64;
+        let offset = self.table.data_offset + start_bin * self.table.bin_size();
+        let end = offset + bytes_to_read;
+        if end > self.mmap.len() {
+            return Err(Error::InvalidInput(format!(
+                "logical block {} reaches byte {} past mapped file length {}",
+                logical_block,
+                end,
+                self.mmap.len()
+            )));
+        }
         let mut payload = vec![0u8; self.block_payload_bytes];
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut payload[..bytes_to_read])?;
+        payload[..bytes_to_read].copy_from_slice(&self.mmap[offset..end]);
         Ok(payload)
     }
 }
@@ -466,6 +479,20 @@ impl Iterator for CuckooPackedBlockReader {
         let block_idx = self.next_block;
         self.next_block += 1;
         Some(self.read_block(block_idx))
+    }
+}
+
+impl TrustedBlockSource for CuckooPackedBlockReader {
+    fn logical_blocks(&self) -> usize {
+        self.logical_blocks()
+    }
+
+    fn block_size(&self) -> usize {
+        self.block_payload_bytes()
+    }
+
+    fn read_block(&mut self, logical_id: usize) -> Result<Vec<u8>> {
+        CuckooPackedBlockReader::read_block(self, logical_id)
     }
 }
 

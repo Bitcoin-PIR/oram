@@ -21,7 +21,7 @@ pub use aead::{AeadPageStore, AEAD_OVERHEAD};
 pub use block::{Bucket, OramBlock};
 pub use circuit::{
     circuit_meta_page_bytes, circuit_payload_page_bytes, CircuitEvictionSchedule, CircuitMetaSlot,
-    CircuitOram,
+    CircuitOram, TrustedBlockSource,
 };
 pub use cuckoo::{
     CuckooLevel, CuckooOramEstimate, CuckooOramSizing, CuckooPackedBlockReader, CuckooTableInfo,

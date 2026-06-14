@@ -721,7 +721,7 @@ fn build_circuit_table(
     }
 
     let started = Instant::now();
-    let mut oram = CircuitOram::build_trusted_from_iter(
+    let mut oram = CircuitOram::build_trusted_from_source(
         params.clone(),
         meta_store,
         payload_store,

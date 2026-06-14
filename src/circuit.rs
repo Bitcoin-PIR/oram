@@ -250,6 +250,12 @@ impl CircuitMetaBucket {
     }
 
     fn encode(&self, bucket_size: usize) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; circuit_meta_page_bytes(bucket_size)];
+        self.encode_into(bucket_size, &mut out)?;
+        Ok(out)
+    }
+
+    fn encode_into(&self, bucket_size: usize, out: &mut [u8]) -> Result<()> {
         if self.slots.len() != bucket_size {
             return Err(Error::InvalidInput(format!(
                 "meta bucket has {} slots, expected {}",
@@ -257,12 +263,19 @@ impl CircuitMetaBucket {
                 bucket_size
             )));
         }
-        let mut out = vec![0u8; circuit_meta_page_bytes(bucket_size)];
+        let expected = circuit_meta_page_bytes(bucket_size);
+        if out.len() != expected {
+            return Err(Error::InvalidInput(format!(
+                "meta output len {} != expected {}",
+                out.len(),
+                expected
+            )));
+        }
         for (i, slot) in self.slots.iter().enumerate() {
             let start = i * CircuitMetaSlot::SERIALIZED_LEN;
             slot.encode_into(&mut out[start..start + CircuitMetaSlot::SERIALIZED_LEN])?;
         }
-        Ok(out)
+        Ok(())
     }
 
     fn decode(input: &[u8], bucket_size: usize) -> Result<Self> {
@@ -383,6 +396,53 @@ pub const fn circuit_payload_page_bytes(bucket_size: usize, block_size: usize) -
     bucket_size * block_size
 }
 
+/// Trusted random-access source for offline Circuit ORAM initialization.
+///
+/// Initialization is intentionally non-oblivious: it happens before the ORAM
+/// image is exposed to an adversarial storage trace. The online controller only
+/// relies on the resulting bucket pages and trusted state.
+pub trait TrustedBlockSource {
+    /// Number of logical ORAM blocks available from this source.
+    fn logical_blocks(&self) -> usize;
+
+    /// Fixed payload bytes in each logical ORAM block.
+    fn block_size(&self) -> usize;
+
+    /// Read one logical block payload.
+    fn read_block(&mut self, logical_id: usize) -> Result<Vec<u8>>;
+}
+
+struct VecBlockSource {
+    blocks: Vec<Vec<u8>>,
+    block_size: usize,
+}
+
+impl VecBlockSource {
+    fn new(blocks: Vec<Vec<u8>>, block_size: usize) -> Self {
+        Self { blocks, block_size }
+    }
+}
+
+impl TrustedBlockSource for VecBlockSource {
+    fn logical_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    fn read_block(&mut self, logical_id: usize) -> Result<Vec<u8>> {
+        self.blocks.get(logical_id).cloned().ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "logical block {} out of range {}",
+                logical_id,
+                self.blocks.len()
+            ))
+        })
+    }
+}
+
 /// Split-store Circuit ORAM controller prototype.
 ///
 /// This controller implements the Circuit ORAM access shape and public
@@ -414,77 +474,89 @@ impl<M: PageStore, P: PageStore> CircuitOram<M, P> {
         blocks: Vec<Vec<u8>>,
         seed: [u8; 32],
     ) -> Result<Self> {
-        Self::build_trusted_from_iter(
+        let block_size = params.block_size;
+        Self::build_trusted_from_source(
             params,
             meta_store,
             payload_store,
-            blocks.into_iter().map(Ok),
+            VecBlockSource::new(blocks, block_size),
             seed,
         )
     }
 
     /// Build a trusted initial Circuit ORAM image from a streaming block source.
     ///
-    /// This keeps bucket metadata and the fixed stash in memory, but writes
-    /// payload pages directly to the backing store as blocks are placed. The
-    /// initialization is non-oblivious and intended for offline image creation
-    /// before exposing storage traces.
+    /// This compatibility helper materializes the iterator and then uses the
+    /// random-access builder. Real cuckoo table builds should call
+    /// [`Self::build_trusted_from_source`] directly so payloads are not kept in
+    /// memory.
     pub fn build_trusted_from_iter<I>(
         params: OramParams,
-        mut meta_store: M,
-        mut payload_store: P,
+        meta_store: M,
+        payload_store: P,
         blocks: I,
         seed: [u8; 32],
     ) -> Result<Self>
     where
         I: IntoIterator<Item = Result<Vec<u8>>>,
     {
+        let blocks = blocks.into_iter().collect::<Result<Vec<_>>>()?;
+        Self::build_trusted(params, meta_store, payload_store, blocks, seed)
+    }
+
+    /// Build a trusted initial Circuit ORAM image from a random-access source.
+    ///
+    /// This keeps only bucket metadata and the fixed stash in memory. The build
+    /// first plans block placement using metadata, then writes metadata and
+    /// payload bucket pages sequentially exactly once. It avoids the previous
+    /// per-block read/modify/write loop over the payload image, which is the
+    /// expensive part for encrypted disk-backed stores.
+    pub fn build_trusted_from_source<S>(
+        params: OramParams,
+        mut meta_store: M,
+        mut payload_store: P,
+        mut source: S,
+        seed: [u8; 32],
+    ) -> Result<Self>
+    where
+        S: TrustedBlockSource,
+    {
         validate_circuit_stores(&params, &meta_store, &payload_store)?;
-        zero_circuit_stores(&params, &mut meta_store, &mut payload_store)?;
+        validate_block_source(&params, &source)?;
 
         let mut rng = ChaCha20Rng::from_seed(seed);
-        let mut pos_map = Vec::with_capacity(params.logical_blocks);
+        let mut pos_map = vec![0u32; params.logical_blocks];
         let mut stash = Vec::new();
+        let mut initial_stash_ids = Vec::new();
         let mut meta_buckets = (0..params.bucket_count())
             .map(|_| CircuitMetaBucket::dummy(params.bucket_size))
             .collect::<Vec<_>>();
 
-        let mut logical_count = 0usize;
-        for (logical_id, payload) in blocks.into_iter().enumerate() {
-            let payload = payload?;
-            if logical_id >= params.logical_blocks {
-                return Err(Error::InvalidInput(format!(
-                    "got more than {} logical blocks",
-                    params.logical_blocks
-                )));
-            }
+        for (logical_id, pos) in pos_map.iter_mut().enumerate() {
             let leaf = random_leaf(&params, &mut rng);
-            pos_map.push(leaf);
-            let block = OramBlock::real(logical_id as u64, leaf, payload, params.block_size)?;
-            if let Some(block) =
-                place_initial_block(&params, &mut meta_buckets, &mut payload_store, block)?
-            {
-                stash.push(block);
-                if stash.len() > params.stash_capacity {
+            *pos = leaf;
+            if !place_initial_meta(&params, &mut meta_buckets, logical_id as u64, leaf)? {
+                initial_stash_ids.push((logical_id, leaf));
+                if initial_stash_ids.len() > params.stash_capacity {
                     return Err(Error::StashOverflow {
-                        len: stash.len(),
+                        len: initial_stash_ids.len(),
                         capacity: params.stash_capacity,
                     });
                 }
             }
-            logical_count += 1;
         }
 
-        if logical_count != params.logical_blocks {
-            return Err(Error::InvalidInput(format!(
-                "got {} blocks, expected {}",
-                logical_count, params.logical_blocks
-            )));
-        }
+        write_initial_metadata(&params, &mut meta_store, &meta_buckets)?;
+        write_initial_payloads(&params, &mut payload_store, &meta_buckets, &mut source)?;
 
-        for (node_idx, bucket) in meta_buckets.iter().enumerate() {
-            let encoded = bucket.encode(params.bucket_size)?;
-            meta_store.write_page(node_idx, &encoded)?;
+        for (logical_id, leaf) in initial_stash_ids {
+            let payload = read_source_block(&params, &mut source, logical_id)?;
+            stash.push(OramBlock::real(
+                logical_id as u64,
+                leaf,
+                payload,
+                params.block_size,
+            )?);
         }
 
         let mut oram = Self {
@@ -989,6 +1061,24 @@ fn validate_circuit_stores(
     Ok(())
 }
 
+fn validate_block_source(params: &OramParams, source: &impl TrustedBlockSource) -> Result<()> {
+    if source.logical_blocks() != params.logical_blocks {
+        return Err(Error::InvalidInput(format!(
+            "block source has {} logical blocks, expected {}",
+            source.logical_blocks(),
+            params.logical_blocks
+        )));
+    }
+    if source.block_size() != params.block_size {
+        return Err(Error::InvalidInput(format!(
+            "block source block_size {} != expected {}",
+            source.block_size(),
+            params.block_size
+        )));
+    }
+    Ok(())
+}
+
 fn validate_circuit_state(
     params: &OramParams,
     pos_map: &[u32],
@@ -1026,57 +1116,87 @@ fn validate_circuit_state(
     Ok(())
 }
 
-fn place_initial_block(
+fn place_initial_meta(
     params: &OramParams,
     meta_buckets: &mut [CircuitMetaBucket],
-    payload_store: &mut impl PageStore,
-    block: OramBlock,
-) -> Result<Option<OramBlock>> {
-    let path = params.path_nodes(block.leaf);
+    logical_id: u64,
+    leaf: u32,
+) -> Result<bool> {
+    let path = params.path_nodes(leaf);
     for node_idx in path.into_iter().rev() {
         for slot_idx in 0..params.bucket_size {
             if !meta_buckets[node_idx].slots[slot_idx].occupied {
-                meta_buckets[node_idx].slots[slot_idx] =
-                    CircuitMetaSlot::real(block.logical_id, block.leaf);
-                write_initial_payload_slot(params, payload_store, node_idx, slot_idx, &block)?;
-                return Ok(None);
+                meta_buckets[node_idx].slots[slot_idx] = CircuitMetaSlot::real(logical_id, leaf);
+                return Ok(true);
             }
         }
     }
-    Ok(Some(block))
+    Ok(false)
 }
 
-fn write_initial_payload_slot(
-    params: &OramParams,
-    payload_store: &mut impl PageStore,
-    node_idx: usize,
-    slot_idx: usize,
-    block: &OramBlock,
-) -> Result<()> {
-    let mut payload_buf =
-        vec![0u8; circuit_payload_page_bytes(params.bucket_size, params.block_size)];
-    payload_store.read_page(node_idx, &mut payload_buf)?;
-    let mut payload_bucket =
-        CircuitPayloadBucket::decode(&payload_buf, params.bucket_size, params.block_size)?;
-    payload_bucket.slots[slot_idx].copy_from_slice(&block.payload);
-    let encoded = payload_bucket.encode(params.bucket_size, params.block_size)?;
-    payload_store.write_page(node_idx, &encoded)?;
-    Ok(())
-}
-
-fn zero_circuit_stores(
+fn write_initial_metadata(
     params: &OramParams,
     meta_store: &mut impl PageStore,
-    payload_store: &mut impl PageStore,
+    meta_buckets: &[CircuitMetaBucket],
 ) -> Result<()> {
-    let meta = CircuitMetaBucket::dummy(params.bucket_size).encode(params.bucket_size)?;
-    let payload = CircuitPayloadBucket::dummy(params.bucket_size, params.block_size)
-        .encode(params.bucket_size, params.block_size)?;
-    for page_idx in 0..params.bucket_count() {
-        meta_store.write_page(page_idx, &meta)?;
-        payload_store.write_page(page_idx, &payload)?;
+    if meta_buckets.len() != params.bucket_count() {
+        return Err(Error::InvalidInput(format!(
+            "metadata bucket count {} != expected {}",
+            meta_buckets.len(),
+            params.bucket_count()
+        )));
+    }
+    let mut encoded = vec![0u8; circuit_meta_page_bytes(params.bucket_size)];
+    for (node_idx, bucket) in meta_buckets.iter().enumerate() {
+        bucket.encode_into(params.bucket_size, &mut encoded)?;
+        meta_store.write_page(node_idx, &encoded)?;
     }
     Ok(())
+}
+
+fn write_initial_payloads<S: TrustedBlockSource>(
+    params: &OramParams,
+    payload_store: &mut impl PageStore,
+    meta_buckets: &[CircuitMetaBucket],
+    source: &mut S,
+) -> Result<()> {
+    if meta_buckets.len() != params.bucket_count() {
+        return Err(Error::InvalidInput(format!(
+            "metadata bucket count {} != expected {}",
+            meta_buckets.len(),
+            params.bucket_count()
+        )));
+    }
+    let mut encoded = vec![0u8; circuit_payload_page_bytes(params.bucket_size, params.block_size)];
+    for (node_idx, bucket) in meta_buckets.iter().enumerate() {
+        encoded.fill(0);
+        for (slot_idx, meta) in bucket.slots.iter().enumerate() {
+            if meta.occupied {
+                let payload = read_source_block(params, source, meta.logical_id as usize)?;
+                let start = slot_idx * params.block_size;
+                encoded[start..start + params.block_size].copy_from_slice(&payload);
+            }
+        }
+        payload_store.write_page(node_idx, &encoded)?;
+    }
+    Ok(())
+}
+
+fn read_source_block<S: TrustedBlockSource>(
+    params: &OramParams,
+    source: &mut S,
+    logical_id: usize,
+) -> Result<Vec<u8>> {
+    let payload = source.read_block(logical_id)?;
+    if payload.len() != params.block_size {
+        return Err(Error::InvalidInput(format!(
+            "source payload for logical block {} has {} bytes, expected {}",
+            logical_id,
+            payload.len(),
+            params.block_size
+        )));
+    }
+    Ok(payload)
 }
 
 fn random_leaf(params: &OramParams, rng: &mut (impl RngCore + CryptoRng)) -> u32 {
@@ -1316,6 +1436,44 @@ mod tests {
         assert_eq!(oram.stash_len(), 4);
         assert_eq!(oram.drain_evictions(3).unwrap(), 3);
         assert_eq!(oram.pending_evictions().unwrap(), 5);
+    }
+
+    #[test]
+    fn split_store_initialization_writes_each_bucket_once_without_output_reads() {
+        let params = OramParams::with_leaves(16, 16, 16)
+            .unwrap()
+            .with_bucket_size(2)
+            .unwrap()
+            .with_stash_capacity(128)
+            .unwrap();
+        let meta_store = TracingStore::new(
+            MemPageStore::new(
+                params.bucket_count(),
+                circuit_meta_page_bytes(params.bucket_size),
+            )
+            .unwrap(),
+        );
+        let payload_store = TracingStore::new(
+            MemPageStore::new(
+                params.bucket_count(),
+                circuit_payload_page_bytes(params.bucket_size, params.block_size),
+            )
+            .unwrap(),
+        );
+        let oram = CircuitOram::build_trusted(
+            params.clone(),
+            meta_store,
+            payload_store,
+            blocks(16, 16),
+            [26; 32],
+        )
+        .unwrap();
+
+        let expected_writes = (0..params.bucket_count())
+            .map(TraceEvent::Write)
+            .collect::<Vec<_>>();
+        assert_eq!(oram.meta_store.take_trace(), expected_writes.clone());
+        assert_eq!(oram.payload_store.take_trace(), expected_writes);
     }
 
     #[test]

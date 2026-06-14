@@ -42,6 +42,9 @@ Implemented:
   page-trace tests.
 - Trusted `CircuitOramState` snapshot/reopen, including RNG state and public
   eviction counters, with optional ChaCha20-Poly1305 state-file encryption.
+- Circuit ORAM trusted bulk initialization that plans metadata first, writes
+  metadata/payload bucket pages sequentially, and uses mmap-backed cuckoo table
+  reads for source payloads.
 
 Intentionally not implemented yet:
 
@@ -50,8 +53,7 @@ Intentionally not implemented yet:
   deepest-first placement, then applies that plan in one fixed payload scan.
 - Recursive position map.
 - Oblivious bulk initialization.
-- High-throughput bulk initialization; current Circuit ORAM build streams
-  payload blocks but still does simple per-placement page updates.
+- Full production bulk-build pipeline for very large all-level snapshots.
 - Crash-safe Circuit ORAM WAL / epoch protocol.
 - Release assembly / SEV-SNP ciphertext-channel audit of the constant-shape hot
   loops.
@@ -220,9 +222,17 @@ chunk.state
 Use `--level index` or `--level chunk` for a one-level trial before building
 both images.
 
-The builder keeps bucket metadata and trusted controller state in memory, but
-streams packed cuckoo payload blocks into the backing payload image instead of
-materializing the whole table as `Vec<Vec<u8>>`.
+The builder keeps bucket metadata and trusted controller state in memory. It
+uses trusted, non-oblivious initialization: first assign random leaves and place
+metadata, then write every metadata page and every payload page exactly once in
+page order. Cuckoo payload source reads are mmap-backed, so bucket-order payload
+assembly does not issue one `seek`/`read` syscall pair per logical block.
+
+On a real `940611` snapshot INDEX build with `pack=16`, `leaf_divisor=4`,
+`Z=2`, encrypted pages, and `cache_levels=0`, this path built
+`index.meta.oram` + `index.payload.oram` + `index.state` in `33645 ms`
+(`34.054s` shell wall time). A 100-op verification benchmark against the
+original cuckoo table verified `100/100` reads with `avg_us=6333.697`.
 
 Verify and benchmark the generated images against the original cuckoo tables:
 
