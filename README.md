@@ -17,6 +17,8 @@ Implemented:
 - `MemPageStore` for tests.
 - `FilePageStore` for NVMe/page-file backed storage.
 - `AeadPageStore` wrapper using ChaCha20-Poly1305 per page.
+- `MerklePageStore` / `TieredMerklePageStore` wrappers that detect runtime
+  rollback of disk-backed pages against trusted in-memory roots.
 - Trusted controller-state checkpoint/reopen (`OramState`), with optional
   ChaCha20-Poly1305 state-file encryption.
 - Fixed-prefix front cache (`FrontCachedPageStore`) for keeping public top ORAM
@@ -55,6 +57,8 @@ Intentionally not implemented yet:
   deepest-first placement, then applies that plan in one fixed payload scan.
 - Recursive position map.
 - Oblivious bulk initialization.
+- Wiring Merkle roots into `CircuitOramState` and the `oramctl` image build /
+  reopen path.
 - Full production bulk-build pipeline for very large all-level snapshots.
 - Crash-safe Circuit ORAM WAL / epoch protocol.
 - Release assembly / SEV-SNP ciphertext-channel audit of the constant-shape hot
@@ -225,10 +229,38 @@ Use `--level index` or `--level chunk` for a one-level trial before building
 both images.
 
 The builder keeps bucket metadata and trusted controller state in memory. It
-uses trusted, non-oblivious initialization: first assign random leaves and place
-metadata, then write every metadata page and every payload page exactly once in
-page order. Cuckoo payload source reads are mmap-backed, so bucket-order payload
-assembly does not issue one `seek`/`read` syscall pair per logical block.
+uses trusted, non-oblivious initialization because BitcoinPIR snapshots are
+public and the ORAM image is generated before serving: first assign random
+leaves, place metadata as close to leaves as possible, then write every metadata
+page and every payload page exactly once in page order. This follows the same
+bulk-build principle as the Oblix/EnigMap initialization line of work, but
+without their oblivious sorting requirement because the input cuckoo table is
+not a private map. Cuckoo payload source reads are mmap-backed, so bucket-order
+payload assembly does not issue one `seek`/`read` syscall pair per logical
+block.
+
+For runtime rollback safety, the page-store layer now has two authentication
+wrappers. `MerklePageStore` keeps the whole hash tree in trusted memory and is
+useful for small tests. `TieredMerklePageStore` keeps only a public number of
+top tree levels in trusted memory and spills lower hash nodes into a second
+`PageStore`; reads recompute the page's authentication path to the trusted
+frontier, and writes update the leaf-to-root path.
+
+`oramctl build-circuit --auth-store` writes authenticated sidecars:
+
+```text
+index.meta.hash.oram
+index.payload.hash.oram
+index.auth.state
+chunk.meta.hash.oram
+chunk.payload.hash.oram
+chunk.auth.state
+```
+
+Use the same `--auth-store` flag when reopening with `bench-circuit` or
+`verify-circuit-bins`; the CLI then loads the trusted top-tree hashes from
+`*.auth.state`, verifies data pages against them, and writes updated roots back
+unless `--no-save` is set.
 
 Current real `940611` snapshot baseline with `pack=16`, `leaf_divisor=4`,
 `Z=2`, encrypted pages, and `cache_levels=0`:

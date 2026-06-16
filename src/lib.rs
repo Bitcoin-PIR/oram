@@ -11,6 +11,7 @@ pub mod circuit;
 pub mod ct;
 pub mod cuckoo;
 pub mod error;
+pub mod merkle;
 pub mod oram;
 pub mod params;
 pub mod state;
@@ -29,8 +30,9 @@ pub use cuckoo::{
     PackedCuckooBinLocation,
 };
 pub use error::{Error, Result};
+pub use merkle::{MerklePageStore, TieredMerklePageStore, TieredMerkleState};
 pub use oram::PathOram;
 pub use params::OramParams;
-pub use state::{CircuitOramState, OramState};
+pub use state::{CircuitOramState, CircuitStoreAuthState, OramState};
 pub use store::{FilePageStore, FrontCachedPageStore, MemPageStore, PageStore, TracingStore};
 pub use stress::{stress_circuit, CircuitStressConfig, CircuitStressPattern, CircuitStressReport};

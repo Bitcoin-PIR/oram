@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use crate::{Error, Result, TieredMerkleState};
 use std::{
     cell::RefCell,
     fs::{File, OpenOptions},
@@ -24,6 +24,11 @@ pub trait PageStore {
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Return trusted authentication state for wrappers that maintain one.
+    fn tiered_merkle_state(&self) -> Option<TieredMerkleState> {
+        None
+    }
 }
 
 impl<T: PageStore + ?Sized> PageStore for Box<T> {
@@ -45,6 +50,10 @@ impl<T: PageStore + ?Sized> PageStore for Box<T> {
 
     fn flush(&mut self) -> Result<()> {
         (**self).flush()
+    }
+
+    fn tiered_merkle_state(&self) -> Option<TieredMerkleState> {
+        (**self).tiered_merkle_state()
     }
 }
 
