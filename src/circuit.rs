@@ -6,7 +6,9 @@
 //! occupancy: real accesses add a fixed amount of public eviction debt, and
 //! background work drains that debt in reverse-bit order.
 
-use crate::{ct, CircuitOramState, Error, OramBlock, OramParams, PageStore, Result};
+use crate::{
+    ct, CircuitOramState, CircuitStoreAuthState, Error, OramBlock, OramParams, PageStore, Result,
+};
 use rand::{CryptoRng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
@@ -641,6 +643,14 @@ impl<M: PageStore, P: PageStore> CircuitOram<M, P> {
     pub fn flush(&mut self) -> Result<()> {
         self.meta_store.flush()?;
         self.payload_store.flush()
+    }
+
+    /// Snapshot authenticated page-store roots, if both stores provide them.
+    pub fn store_auth_state(&self) -> Option<CircuitStoreAuthState> {
+        Some(CircuitStoreAuthState::new(
+            self.meta_store.tiered_merkle_state()?,
+            self.payload_store.tiered_merkle_state()?,
+        ))
     }
 
     /// Read a logical block and schedule public background eviction debt.

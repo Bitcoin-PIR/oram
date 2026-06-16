@@ -95,6 +95,21 @@ Both stores must be accessed in a fixed public shape for the selected operation.
 Metadata pages can be much smaller than payload pages, so Circuit ORAM's
 `deepest` and `target` scans do not pay the full payload I/O cost.
 
+Disk pages must also be rollback-authenticated against trusted memory. The page
+store layer has two wrappers:
+
+- `MerklePageStore`: keeps the full SHA-256 Merkle tree in trusted memory.
+- `TieredMerklePageStore`: keeps only a public number of top levels in trusted
+  memory and stores lower hash nodes in a second `PageStore`.
+
+`TieredMerklePageStore` is the intended production boundary. Reads recompute the
+data page's authentication path to the trusted frontier. Writes update the data
+page, leaf hash, lower disk-backed hash nodes, and trusted top hashes.
+`oramctl build-circuit --auth-store` now emits per-level metadata/payload hash
+images plus an auth-state sidecar; `bench-circuit --auth-store` and
+`verify-circuit-bins --auth-store` reopen through that sidecar and save updated
+trusted roots after mutating reads.
+
 ## Access State Machine
 
 Each real read has an online phase and an eviction phase.
@@ -230,13 +245,19 @@ eviction to cross a durable boundary.
    Partly done: split-store fixed-shape trace tests and `CircuitOramState`
    state-file encryption are in place; metadata/payload image encryption CLI
    wiring is still pending.
-6. Add a crash-safe WAL or epoch protocol for delayed eviction.
-7. Add a build path from existing DPF/Harmony cuckoo tables into ORAM images.
+6. Add runtime rollback authentication for disk pages.
+   Partly done: `MerklePageStore` authenticates pages against a trusted
+   in-memory hash tree, and `TieredMerklePageStore` keeps only trusted top
+   levels while spilling lower hash nodes to disk. `oramctl` can build and
+   reopen authenticated sidecars. Pending: deciding whether auth roots remain a
+   sidecar or become embedded in `CircuitOramState`.
+7. Add a crash-safe WAL or epoch protocol for delayed eviction.
+8. Add a build path from existing DPF/Harmony cuckoo tables into ORAM images.
    Done for trusted/offline initialization via `oramctl build-circuit`.
    `oramctl bench-circuit --db-dir ...` reopens the split images and verifies
    random reads against the original packed cuckoo payload. High-throughput
    bulk placement and final manifest wiring are still pending.
-8. Run release assembly and SEV-SNP page-trace audit on the hot loops.
+9. Run release assembly and SEV-SNP page-trace audit on the hot loops.
 
 ## Current Design Choice
 
