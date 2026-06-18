@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
     hint::black_box,
     path::{Path, PathBuf},
     time::Instant,
@@ -153,6 +153,20 @@ enum Command {
         /// Direct INDEX cuckoo seed, as a u64.
         #[arg(long, default_value_t = DIRECT_INDEX_DEFAULT_SEED)]
         index_seed: u64,
+    },
+    /// Reconstruct direct CHUNK source bytes from a deployed PBC chunk cuckoo table.
+    ///
+    /// This is lossless for CHUNK because PBC chunk slots contain
+    /// `[4B chunk_id][40B chunk_data]`. It cannot reconstruct the direct INDEX
+    /// source because PBC index slots store only an 8-byte fingerprint tag, not
+    /// the original 20-byte script hash.
+    ExtractDirectChunks {
+        /// DPF/Harmony chunk_pir_cuckoo.bin.
+        #[arg(long)]
+        chunk_cuckoo_file: PathBuf,
+        /// Output direct CHUNK source file, usually utxo_chunks_nodust.bin.
+        #[arg(long)]
+        out_file: PathBuf,
     },
     /// Build split-store Circuit ORAM images from DPF/Harmony cuckoo tables.
     BuildCircuit {
@@ -623,6 +637,12 @@ fn main() -> Result<()> {
                 index_load_factor,
                 index_seed,
             )?;
+        }
+        Command::ExtractDirectChunks {
+            chunk_cuckoo_file,
+            out_file,
+        } => {
+            extract_direct_chunks(&chunk_cuckoo_file, &out_file)?;
         }
         Command::BuildCircuit {
             db_dir,
@@ -1097,6 +1117,154 @@ fn direct_infos(
         )?,
         DirectTableInfo::from_chunks_file(chunks_file)?,
     ])
+}
+
+fn extract_direct_chunks(chunk_cuckoo_file: &Path, out_file: &Path) -> Result<()> {
+    const CHUNK_ID_BYTES: usize = 4;
+    const CHUNK_DATA_BYTES: usize = 40;
+    const CHUNK_SLOT_BYTES: usize = CHUNK_ID_BYTES + CHUNK_DATA_BYTES;
+
+    let info = CuckooTableInfo::from_file(CuckooLevel::Chunk, chunk_cuckoo_file)?;
+    if info.slot_size != CHUNK_SLOT_BYTES {
+        return Err(Error::InvalidInput(format!(
+            "chunk cuckoo slot size {} != expected {}",
+            info.slot_size, CHUNK_SLOT_BYTES
+        )));
+    }
+
+    let input = File::open(chunk_cuckoo_file)?;
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&input)? };
+    let table = &mmap[info.data_offset..];
+    if table.len() % CHUNK_SLOT_BYTES != 0 {
+        return Err(Error::InvalidInput(format!(
+            "chunk cuckoo payload size {} is not a multiple of {}",
+            table.len(),
+            CHUNK_SLOT_BYTES
+        )));
+    }
+
+    let started = Instant::now();
+    let mut non_empty_slots = 0usize;
+    let mut max_chunk_id = None::<u32>;
+    for slot in table.chunks_exact(CHUNK_SLOT_BYTES) {
+        if is_zero_slot(slot) {
+            continue;
+        }
+        non_empty_slots += 1;
+        let chunk_id = u32::from_le_bytes(slot[..CHUNK_ID_BYTES].try_into().expect("chunk id"));
+        max_chunk_id = Some(max_chunk_id.map_or(chunk_id, |m| m.max(chunk_id)));
+    }
+
+    let Some(max_chunk_id) = max_chunk_id else {
+        return Err(Error::InvalidInput(format!(
+            "no non-empty CHUNK slots found in {}",
+            chunk_cuckoo_file.display()
+        )));
+    };
+    let chunk_count = max_chunk_id as usize + 1;
+    let out_bytes = chunk_count
+        .checked_mul(CHUNK_DATA_BYTES)
+        .ok_or_else(|| Error::InvalidInput("direct chunk output size overflow".into()))?;
+
+    if let Some(parent) = out_file.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let out = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(out_file)?;
+    out.set_len(out_bytes as u64)?;
+    let mut out_map = unsafe { memmap2::MmapOptions::new().len(out_bytes).map_mut(&out)? };
+    let mut seen = vec![0u8; chunk_count.div_ceil(8)];
+    let mut unique_chunks = 0usize;
+    let mut duplicate_slots = 0usize;
+    let mut conflicting_duplicates = 0usize;
+
+    for slot in table.chunks_exact(CHUNK_SLOT_BYTES) {
+        if is_zero_slot(slot) {
+            continue;
+        }
+        let chunk_id =
+            u32::from_le_bytes(slot[..CHUNK_ID_BYTES].try_into().expect("chunk id")) as usize;
+        let chunk = &slot[CHUNK_ID_BYTES..CHUNK_SLOT_BYTES];
+        let out_start = chunk_id
+            .checked_mul(CHUNK_DATA_BYTES)
+            .ok_or_else(|| Error::InvalidInput("direct chunk offset overflow".into()))?;
+        let out_end = out_start + CHUNK_DATA_BYTES;
+        if bit_is_set(&seen, chunk_id) {
+            duplicate_slots += 1;
+            if &out_map[out_start..out_end] != chunk {
+                conflicting_duplicates += 1;
+                if conflicting_duplicates <= 5 {
+                    eprintln!("conflicting duplicate for chunk_id={chunk_id}");
+                }
+            }
+            continue;
+        }
+        set_bit(&mut seen, chunk_id);
+        unique_chunks += 1;
+        out_map[out_start..out_end].copy_from_slice(chunk);
+    }
+
+    if conflicting_duplicates > 0 {
+        return Err(Error::InvalidInput(format!(
+            "found {} conflicting duplicate chunk slots in {}",
+            conflicting_duplicates,
+            chunk_cuckoo_file.display()
+        )));
+    }
+
+    if unique_chunks != chunk_count {
+        let mut missing = Vec::new();
+        for chunk_id in 0..chunk_count {
+            if !bit_is_set(&seen, chunk_id) {
+                missing.push(chunk_id);
+                if missing.len() == 8 {
+                    break;
+                }
+            }
+        }
+        return Err(Error::InvalidInput(format!(
+            "chunk ids are not contiguous: recovered {} unique chunks but max_chunk_id={} implies {}; first missing ids={:?}",
+            unique_chunks, max_chunk_id, chunk_count, missing
+        )));
+    }
+
+    out_map.flush()?;
+    drop(out_map);
+    out.sync_all()?;
+
+    println!("extract_direct_chunks=true");
+    println!("chunk_cuckoo_file={}", chunk_cuckoo_file.display());
+    println!("out_file={}", out_file.display());
+    println!("anchor={}", info.anchor_kind);
+    println!("data_offset={}", info.data_offset);
+    println!("k={}", info.k);
+    println!("bins_per_table={}", info.bins_per_table);
+    println!("slots_per_bin={}", info.slots_per_bin);
+    println!("non_empty_slots={non_empty_slots}");
+    println!("duplicate_slots={duplicate_slots}");
+    println!("unique_chunks={unique_chunks}");
+    println!("output_bytes={out_bytes}");
+    println!("output_gib={:.3}", gib(out_bytes as u64));
+    println!("elapsed_ms={}", started.elapsed().as_millis());
+    Ok(())
+}
+
+fn is_zero_slot(slot: &[u8]) -> bool {
+    slot.iter().all(|&b| b == 0)
+}
+
+fn bit_is_set(bits: &[u8], idx: usize) -> bool {
+    bits[idx / 8] & (1u8 << (idx % 8)) != 0
+}
+
+fn set_bit(bits: &mut [u8], idx: usize) {
+    bits[idx / 8] |= 1u8 << (idx % 8);
 }
 
 #[allow(clippy::too_many_arguments)]
