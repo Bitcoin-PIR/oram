@@ -26,22 +26,13 @@ The delta pipeline uses the same direct index/chunk record shape.
 - `scan_update`: branchless full scan that selects the old leaf and writes a
   new leaf with a constant-shape store to every entry.
 
-VPSBG results, `ops=200`, `warmup_ops=20`:
-
-| Position-map entries | Map size | Scan | Scan + update |
-| ---: | ---: | ---: | ---: |
-| 249,760 | 0.95 MiB | 52.5 us | 84.1 us |
-| 561,660 | 2.14 MiB | 117.5 us | 189.1 us |
-| 2,660,429 | 10.15 MiB | 556.4 us | 894.8 us |
-| 5,334,640 | 20.35 MiB | 1.11 ms | 1.80 ms |
-
-Estimated direct-entry packed sizes are similar to today's largest maps if we
-keep `pack=16`:
+VPSBG results for the projected direct-entry packed sizes, `ops=1000`,
+`warmup_ops=50`:
 
 | Estimated direct table | Packed ORAM blocks | Map size | Scan | Scan + update |
 | --- | ---: | ---: | ---: | ---: |
-| FULL direct index | ~3.37M | 12.86 MiB | 615.1 us | 1.15 ms |
-| FULL direct chunks | ~5.07M | 19.34 MiB | 1.02 ms | 1.71 ms |
+| FULL direct index | ~3.37M | 12.86 MiB | 673.5 us | 1.13 ms |
+| FULL direct chunks | ~5.07M | 19.34 MiB | 1.05 ms | 1.70 ms |
 
 Conclusion: full-scan position-map access is acceptable for the current packed
 block counts. It is not acceptable if we make every 40-byte chunk its own ORAM
