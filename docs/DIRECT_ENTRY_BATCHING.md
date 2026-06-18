@@ -26,17 +26,43 @@ The delta pipeline uses the same direct index/chunk record shape.
 - `scan_update`: branchless full scan that selects the old leaf and writes a
   new leaf with a constant-shape store to every entry.
 
-VPSBG results for the projected direct-entry packed sizes, `ops=1000`,
-`warmup_ops=50`:
+VPSBG results for the current canonical direct-entry packed sizes, `ops=2000`,
+`warmup_ops=200`:
 
-| Estimated direct table | Packed ORAM blocks | Map size | Scan | Scan + update |
+| Direct table | Packed ORAM blocks | Map size | Scan | Scan + update |
 | --- | ---: | ---: | ---: | ---: |
-| FULL direct index | ~3.37M | 12.86 MiB | 673.5 us | 1.13 ms |
-| FULL direct chunks | ~5.07M | 19.34 MiB | 1.05 ms | 1.70 ms |
+| Canonical DELTA direct index | 82,808 | 0.316 MiB | 14.5 us | 28.3 us |
+| Canonical DELTA direct chunks | 531,611 | 2.028 MiB | 92.6 us | 178.7 us |
+| FULL direct index | 885,445 | 3.378 MiB | 153.7 us | 297.5 us |
+| FULL direct chunks | 5,061,532 | 19.308 MiB | 877.9 us | 1.71 ms |
 
 Conclusion: full-scan position-map access is acceptable for the current packed
 block counts. It is not acceptable if we make every 40-byte chunk its own ORAM
 logical block and grow the position map by 16x.
+
+A local macOS development-machine run against the canonical direct dimensions
+used a temporary standalone ORAM checkout outside the main BitcoinPIR cargo
+vendor override:
+
+```text
+cargo run --release --bin oramctl -- \
+  bench-pos-map --sizes 82808,531611,885445,5061532 \
+  --ops 2000 --warmup-ops 200
+```
+
+| Direct table | Packed ORAM blocks | Map size | Scan | Scan + update |
+| --- | ---: | ---: | ---: | ---: |
+| Canonical DELTA direct index | 82,808 | 0.316 MiB | 30.5 us | 34.2 us |
+| Canonical DELTA direct chunks | 531,611 | 2.028 MiB | 251.0 us | 329.6 us |
+| FULL direct index | 885,445 | 3.378 MiB | 409.6 us | 424.4 us |
+| FULL direct chunks | 5,061,532 | 19.308 MiB | 1.99 ms | 3.32 ms |
+
+The VPSBG numbers are the production-relevant ones. The local run is still a
+useful guardrail: even on the slower local path, full CHUNK map scan+update is
+single-digit milliseconds for `pack=16`, so it is not the dominant term in the
+current server-smoke timings. Do not reduce `pack` to 1 for CHUNK without
+redoing this benchmark, because that would grow the CHUNK position map by about
+16x.
 
 ## Direct-entry layout
 
@@ -93,6 +119,40 @@ chunk_budget = access_budget - index_reads
 
 The request should reject or split batches when `index_reads > access_budget`.
 
+With the current `hash_fns=2` and `access_budget=50`:
+
+- one script hash leaves 48 CHUNK reads;
+- 10 script hashes leave 30 CHUNK reads shared by all found results;
+- 20 script hashes leave 10 CHUNK reads;
+- 24 script hashes leaves 2 CHUNK reads, which is suitable only for mostly
+  not-found or known-small lookups;
+- 25 script hashes consumes the whole budget on INDEX reads and can only serve
+  an all-not-found batch.
+
+The implemented first cut keeps the request length public and fixed-fills only
+within that request's access budget. If real CHUNK demand exceeds the remaining
+budget, the server drains the remaining dummy chunk budget, persists the mutated
+ORAM state, and returns an error. A production wallet-sync planner should split
+such batches ahead of time or add an explicit continuation token.
+
+The web adapter exposes this as an opt-in fixed-budget planner instead of the
+DPF/Harmony PBC batch planner:
+
+```ts
+planOramScriptHashBatches(scriptHashes, {
+  accessBudget: 50,
+  indexReadsPerScriptHash: 2,
+  expectedChunkReadsPerScriptHash: 1,
+  chunkReadReserve: 0,
+});
+```
+
+This example derives 16 script hashes per request because each hash is modeled
+as two INDEX reads plus one expected CHUNK read. For mostly-not-found scans,
+`expectedChunkReadsPerScriptHash: 0` derives 25 script hashes. For safer
+ordinary wallet sync, keep a chunk reserve or an explicit
+`maxScriptHashesPerRequest` cap.
+
 ## Engineering sequence
 
 1. Add direct table builders in the standalone ORAM repo:
@@ -102,9 +162,48 @@ The request should reject or split batches when `index_reads > access_budget`.
 2. Add an `oramctl size-direct` estimator before building images. (Done.)
 3. Add an `oramctl build-direct` command for FULL and DELTA. (Done for the
    standalone ORAM image format.)
-4. Add a runtime direct-ORAM reader beside the current cuckoo reader.
+4. Add a runtime direct-ORAM reader beside the current cuckoo reader. (Done in
+   the main repo worktree; built and smoked from the VPSBG test checkout.)
 5. Add a native direct batch request/response type in `pir-sdk-client` and
-   `unified_server`.
-6. Benchmark fixed budgets: 16, 32, 50, 64 ORAM accesses.
-7. Once direct lookup is verified, make PBC-cuckoo ORAM a compatibility mode
-   rather than the primary ORAM backend.
+   `unified_server`. (Done in the main repo worktree.)
+6. Keep HarmonyPIR/DPF on their mmap-backed PBC databases. ORAM lookup is a
+   separate `REQ_ORAM_LOOKUP` path; legacy PBC-cuckoo ORAM should be only a
+   compatibility fallback for that ORAM opcode.
+7. Benchmark fixed budgets: 16, 32, 50, 64 ORAM accesses. (Pending beyond the
+   50-access synthetic smoke.)
+8. Add client-side batch planning: choose `script_hashes.len()` so
+   `hash_fns * len + expected_chunks <= access_budget`, split otherwise, and
+   later replace overflow errors with continuation tokens if large wallets need
+   it.
+
+## VPSBG smoke status
+
+Built direct images:
+
+- FULL: `/home/pir/data/oram/checkpoints/948454-direct-pack16-z2-div2-stash128-auth`
+- canonical DELTA:
+  `/home/pir/data/oram/deltas/940611_948454_canonical-direct-pack16-z2-div2-stash128-auth`
+
+The canonical DELTA direct input pair was regenerated from the attested-builder
+txoutset inputs at builder commit `01e8db91d76037cd5562fce85c40e832ad156431`:
+
+- `utxo_chunks_index_nodust.bin`: 125,867,300 bytes,
+  SHA-256 `e06fc3dedf30096124888acef3024f21a9c049d59fd8c7d518aaf8a58ac6aa16`;
+- `utxo_chunks_nodust.bin`: 340,230,840 bytes,
+  SHA-256 `536acb605396056118c7c0836988f369c5abbfc3f7e90732ad93e819d5188e0a`.
+
+Two-db direct server smoke passed on VPSBG using the real `databases.toml`,
+direct FULL as db_id 0, and direct canonical DELTA as db_id 1. The smoke
+verified cleartext ORAM rejection and encrypted-channel ORAM queries with
+`sev_status=ReportDataMatch`. Synthetic not-found lookup timings were:
+
+- db_id 0 FULL: 647.54 ms;
+- db_id 1 canonical DELTA: 698.85 ms.
+
+A second smoke used one known-present FULL script hash and one known-present
+canonical DELTA script hash in the same fixed-budget request. It verified found
+results, direct CHUNK reads, and client-side result decoding:
+
+- db_id 0 FULL, two script hashes: 635.24 ms, one found UTXO;
+- db_id 1 canonical DELTA, two script hashes: 575.75 ms, one found delta
+  record.
