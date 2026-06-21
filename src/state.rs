@@ -1,4 +1,7 @@
-use crate::{CircuitEvictionSchedule, Error, OramBlock, OramParams, Result, TieredMerkleState};
+use crate::{
+    CircuitEvictionSchedule, EmbeddedTreeState, Error, OramBlock, OramParams, Result,
+    TieredMerkleState,
+};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
@@ -301,23 +304,98 @@ impl CircuitOramState {
 /// checkpoints remain readable. Treat it with the same trust boundary as the
 /// controller state: keep it in TEE memory, or encrypt/seal it if it is written
 /// outside the TEE.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CircuitStoreAuthState {
     magic: [u8; 8],
-    /// Metadata store Merkle top-tree state.
+    /// Authenticated store layout and trusted roots.
+    pub layout: CircuitStoreAuthLayout,
+}
+
+/// Authenticated store layout and trusted roots for both split stores.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CircuitStoreAuthLayout {
+    /// Existing tiered Merkle sidecar layout.
+    TieredMerkle {
+        /// Metadata store Merkle top-tree state.
+        meta: TieredMerkleState,
+        /// Payload store Merkle top-tree state.
+        payload: TieredMerkleState,
+    },
+    /// Embedded tree layout with child hashes inside bucket pages.
+    EmbeddedTree {
+        /// Metadata store embedded-tree root state.
+        meta: EmbeddedTreeState,
+        /// Payload store embedded-tree root state.
+        payload: EmbeddedTreeState,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LegacyCircuitStoreAuthState {
+    magic: [u8; 8],
     pub meta: TieredMerkleState,
-    /// Payload store Merkle top-tree state.
     pub payload: TieredMerkleState,
 }
 
 impl CircuitStoreAuthState {
-    /// Construct store-authentication state.
+    /// Construct tiered-Merkle sidecar authentication state.
     pub fn new(meta: TieredMerkleState, payload: TieredMerkleState) -> Self {
         Self {
             magic: *CIRCUIT_STORE_AUTH_MAGIC,
-            meta,
-            payload,
+            layout: CircuitStoreAuthLayout::TieredMerkle { meta, payload },
         }
+    }
+
+    /// Construct embedded-tree authentication state.
+    pub fn new_embedded(meta: EmbeddedTreeState, payload: EmbeddedTreeState) -> Self {
+        Self {
+            magic: *CIRCUIT_STORE_AUTH_MAGIC,
+            layout: CircuitStoreAuthLayout::EmbeddedTree { meta, payload },
+        }
+    }
+
+    /// Return tiered-Merkle roots when this auth sidecar uses that layout.
+    pub const fn tiered_merkle(&self) -> Option<(&TieredMerkleState, &TieredMerkleState)> {
+        match &self.layout {
+            CircuitStoreAuthLayout::TieredMerkle { meta, payload } => Some((meta, payload)),
+            CircuitStoreAuthLayout::EmbeddedTree { .. } => None,
+        }
+    }
+
+    /// Return embedded-tree roots when this auth sidecar uses that layout.
+    pub const fn embedded_tree(&self) -> Option<(&EmbeddedTreeState, &EmbeddedTreeState)> {
+        match &self.layout {
+            CircuitStoreAuthLayout::EmbeddedTree { meta, payload } => Some((meta, payload)),
+            CircuitStoreAuthLayout::TieredMerkle { .. } => None,
+        }
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        match bincode::deserialize::<Self>(bytes) {
+            Ok(state) => {
+                state.validate_magic()?;
+                Ok(state)
+            }
+            Err(new_err) => {
+                let legacy: LegacyCircuitStoreAuthState =
+                    bincode::deserialize(bytes).map_err(|_| Error::Bincode(new_err))?;
+                if &legacy.magic != CIRCUIT_STORE_AUTH_MAGIC {
+                    return Err(Error::InvalidInput(
+                        "invalid Circuit ORAM store-auth magic".into(),
+                    ));
+                }
+                Ok(Self::new(legacy.meta, legacy.payload))
+            }
+        }
+    }
+
+    fn validate_magic(&self) -> Result<()> {
+        if &self.magic != CIRCUIT_STORE_AUTH_MAGIC {
+            return Err(Error::InvalidInput(
+                "invalid Circuit ORAM store-auth magic".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Persist state atomically via temp-file-and-rename.
@@ -371,15 +449,8 @@ impl CircuitStoreAuthState {
 
     /// Load a store-authentication sidecar.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let state: Self = bincode::deserialize_from(reader)?;
-        if &state.magic != CIRCUIT_STORE_AUTH_MAGIC {
-            return Err(Error::InvalidInput(
-                "invalid Circuit ORAM store-auth magic".into(),
-            ));
-        }
-        Ok(state)
+        let bytes = fs::read(path)?;
+        Self::from_bytes(&bytes)
     }
 
     /// Load an AEAD-encrypted store-authentication sidecar.
@@ -411,13 +482,8 @@ impl CircuitStoreAuthState {
         )?;
         envelope.zeroize();
 
-        let state: Self = bincode::deserialize(&plaintext)?;
+        let state = Self::from_bytes(&plaintext)?;
         plaintext.zeroize();
-        if &state.magic != CIRCUIT_STORE_AUTH_MAGIC {
-            return Err(Error::InvalidInput(
-                "invalid Circuit ORAM store-auth magic".into(),
-            ));
-        }
         Ok(state)
     }
 }
@@ -472,6 +538,16 @@ mod tests {
         CircuitStoreAuthState::new(merkle.clone(), merkle)
     }
 
+    fn sample_embedded_store_auth_state() -> CircuitStoreAuthState {
+        let embedded = EmbeddedTreeState {
+            store_id: *b"bpir-idx-meta-v1",
+            page_count: 8,
+            logical_page_size: 64,
+            root_hash: [7u8; 32],
+        };
+        CircuitStoreAuthState::new_embedded(embedded.clone(), embedded)
+    }
+
     #[test]
     fn encrypted_state_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -516,7 +592,17 @@ mod tests {
         state.save_encrypted_atomic(&path, [8; 32]).unwrap();
 
         let loaded = CircuitStoreAuthState::load_encrypted(&path, [8; 32]).unwrap();
-        assert_eq!(loaded.meta, state.meta);
-        assert_eq!(loaded.payload, state.payload);
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn encrypted_circuit_embedded_store_auth_state_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embedded-store-auth.state");
+        let state = sample_embedded_store_auth_state();
+        state.save_encrypted_atomic(&path, [8; 32]).unwrap();
+
+        let loaded = CircuitStoreAuthState::load_encrypted(&path, [8; 32]).unwrap();
+        assert_eq!(loaded, state);
     }
 }

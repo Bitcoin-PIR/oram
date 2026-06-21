@@ -192,14 +192,14 @@ impl<S: PageStore> PathOram<S> {
         let path = self.params.path_nodes(old_leaf);
         self.read_path_into_stash(&path)?;
 
-        let mut found = 0u8;
+        let mut found = ct::choice_from_bool(false);
         let mut output = vec![0u8; self.params.block_size];
         for block in &self.stash {
             let matched = block.logical_id_choice(logical_id);
             ct::cmov_bytes(&mut output, &block.payload, matched);
             found = ct::or(found, matched);
         }
-        if found == 0 {
+        if ct::not(found).unwrap_u8() == 1 {
             return Err(Error::BlockNotFound(logical_id));
         }
 
@@ -236,7 +236,7 @@ impl<S: PageStore> PathOram<S> {
             let mut bucket = Bucket::dummy(self.params.bucket_size, self.params.block_size);
             for slot in &mut bucket.blocks {
                 let mut selected = OramBlock::dummy(self.params.block_size);
-                let mut filled = 0u8;
+                let mut filled = ct::choice_from_bool(false);
                 for stash_slot in &mut self.stash {
                     let occupied = ct::choice_from_bool(stash_slot.occupied);
                     let can_place = ct::and(
@@ -315,7 +315,7 @@ impl<S: PageStore> PathOram<S> {
             inserted = ct::or(inserted, can_insert);
         }
 
-        if inserted == 0 {
+        if ct::not(inserted).unwrap_u8() == 1 {
             return Err(Error::StashOverflow {
                 len: self.params.stash_capacity + 1,
                 capacity: self.params.stash_capacity,

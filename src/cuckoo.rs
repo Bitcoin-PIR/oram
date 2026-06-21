@@ -5,7 +5,8 @@
 //! of scope for this crate.
 
 use crate::{
-    CircuitOram, Error, OramBlock, OramParams, PageStore, Result, TrustedBlockSource, AEAD_OVERHEAD,
+    CircuitOram, Error, OramBlock, OramParams, PathPageStore, Result, TrustedBlockSource,
+    AEAD_OVERHEAD,
 };
 use memmap2::{Mmap, MmapOptions};
 use std::{
@@ -551,7 +552,7 @@ pub struct CircuitCuckooBinReader<M, P> {
     oram: CircuitOram<M, P>,
 }
 
-impl<M: PageStore, P: PageStore> CircuitCuckooBinReader<M, P> {
+impl<M: PathPageStore, P: PathPageStore> CircuitCuckooBinReader<M, P> {
     /// Wrap an opened Circuit ORAM controller for the matching cuckoo table.
     pub fn new(
         table: &CuckooTableInfo,

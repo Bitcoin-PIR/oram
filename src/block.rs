@@ -205,19 +205,19 @@ mod tests {
         let mut block = OramBlock::real(7, 3, vec![1, 2, 3, 4], 4).unwrap();
         let other = OramBlock::real(9, 5, vec![9, 8, 7, 6], 4).unwrap();
 
-        block.cmov_from(&other, 0);
+        block.cmov_from(&other, ct::choice_from_bool(false));
         assert_eq!(block.logical_id, 7);
         assert_eq!(block.leaf, 3);
         assert_eq!(block.payload, vec![1, 2, 3, 4]);
 
-        block.cmov_from(&other, 1);
+        block.cmov_from(&other, ct::choice_from_bool(true));
         assert_eq!(block.logical_id, 9);
         assert_eq!(block.leaf, 5);
         assert_eq!(block.payload, vec![9, 8, 7, 6]);
 
-        block.clear_if(0, 4);
+        block.clear_if(ct::choice_from_bool(false), 4);
         assert!(block.occupied);
-        block.clear_if(1, 4);
+        block.clear_if(ct::choice_from_bool(true), 4);
         assert!(!block.occupied);
         assert_eq!(block.logical_id, u64::MAX);
         assert_eq!(block.leaf, u32::MAX);
