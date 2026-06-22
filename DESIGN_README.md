@@ -318,6 +318,8 @@ git diff --check
 - Decide the exact public production batch shape and enforce it at the API
   boundary.
 - Replace prototype state keys with SEV-sealed state handling.
+- Bind controller state and authentication roots into one sealed, atomic state
+  version.
 - Add crash-safe WAL or epoch handling for image and state updates.
 - Integrate the direct-entry ORAM reader into the serving path.
 - Keep Ring ORAM as a documented non-selected experiment, not the main path.

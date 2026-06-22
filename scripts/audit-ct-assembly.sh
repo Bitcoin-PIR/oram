@@ -68,6 +68,7 @@ for symbol in \
   ensure_eviction_stash_capacity \
   insert_candidate_into_stash \
   select_and_remove_target_slots \
+  clear_payload_volatile_if \
   clear_payload_if \
   select_index_record_from_bin
 do
@@ -82,22 +83,33 @@ if [[ "$missing" -ne 0 ]]; then
 fi
 
 echo
-echo "clear_payload_if_window:"
-clear_match="$(grep -Hn 'clear_payload_if' "${asm_files[@]}" | head -n 1 || true)"
-if [[ -z "$clear_match" ]]; then
-  echo "missing clear_payload_if; cannot inspect conditional payload clear" >&2
-  exit 1
-fi
-clear_file="${clear_match%%:*}"
-clear_rest="${clear_match#*:}"
-clear_line="${clear_rest%%:*}"
-sed -n "${clear_line},$((clear_line + 90))p" "$clear_file"
+for clear_symbol in clear_payload_volatile_if clear_payload_if; do
+  echo "${clear_symbol}_window:"
+  clear_match="$(grep -Hn "$clear_symbol" "${asm_files[@]}" | head -n 1 || true)"
+  if [[ -z "$clear_match" ]]; then
+    echo "missing $clear_symbol; cannot inspect conditional payload clear" >&2
+    exit 1
+  fi
+  clear_file="${clear_match%%:*}"
+  clear_rest="${clear_match#*:}"
+  clear_line="${clear_rest%%:*}"
+  sed -n "${clear_line},$((clear_line + 90))p" "$clear_file"
 
-if sed -n "${clear_line},$((clear_line + 90))p" "$clear_file" | grep -Eq '_?bzero|_?memset'; then
-  echo "clear_payload_if contains bzero/memset in the inspected window" >&2
-  exit 1
-fi
+  if sed -n "${clear_line},$((clear_line + 90))p" "$clear_file" | grep -Eq '_?bzero|_?memset'; then
+    echo "$clear_symbol contains bzero/memset in the inspected window" >&2
+    exit 1
+  fi
+  echo
+done
 
 echo
 echo "global_memset_bzero_refs_non_fatal:"
 grep -HnE '_?bzero|_?memset' "${asm_files[@]}" || true
+
+echo
+echo "variable_shift_refs_review_non_fatal:"
+if grep -HnE $'\\b(shl|shr|sar|sal)[a-z]*[[:space:]]+%cl|\\b(lsl|lsr|asr)[[:space:]]+[wx][0-9]+,[[:space:]]*[wx][0-9]+,[[:space:]]*[wx][0-9]+' "${asm_files[@]}"; then
+  echo "review_note=variable shifts above need target CPU latency review when they are in audited hot symbols"
+else
+  echo "none"
+fi

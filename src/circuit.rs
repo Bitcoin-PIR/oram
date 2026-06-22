@@ -926,6 +926,9 @@ impl<M: PathPageStore, P: PathPageStore> CircuitOram<M, P> {
         let mut selected = OramBlock::dummy(self.params.block_size);
         let mut removed = ct::choice_from_bool(false);
 
+        // Deliberately rewrite every page on the path, even if only one slot
+        // changed. Rewriting only changed pages would leak the target depth in
+        // the host-visible write set.
         for (meta_buf, payload_buf) in meta_pages.iter_mut().zip(&mut payload_pages) {
             let mut meta_bucket = CircuitMetaBucket::decode(meta_buf, self.params.bucket_size)?;
             let mut payload_bucket = CircuitPayloadBucket::decode(
@@ -962,6 +965,9 @@ impl<M: PathPageStore, P: PathPageStore> CircuitOram<M, P> {
     ) -> Result<()> {
         let mut selected = OramBlock::dummy(self.params.block_size);
         let mut removed = ct::choice_from_bool(false);
+        // `path` is a public random ORAM path. BTreeMap lookups are keyed only
+        // by public page indices; block contents never influence overlay keys
+        // or the number of path pages visited.
         for page_idx in path {
             let meta_buf = meta_overlay
                 .get_mut(page_idx)
@@ -1159,6 +1165,9 @@ impl<M: PathPageStore, P: PathPageStore> CircuitOram<M, P> {
             }
         }
 
+        // Eviction paths and page indices are public. Overlay writes are keyed
+        // by those public page indices; secret placement choices only affect
+        // masked slot contents inside the page bytes.
         for (depth, page_idx) in path.iter().enumerate() {
             let mut meta_bucket = CircuitMetaBucket::dummy(self.params.bucket_size);
             let mut payload_bucket =
@@ -1192,6 +1201,10 @@ impl<M: PathPageStore, P: PathPageStore> CircuitOram<M, P> {
     }
 
     fn node_contains_leaf_choice(&self, depth: usize, node_idx: usize, leaf: u32) -> ct::Choice {
+        // `depth` and `node_idx` are public loop values. `leaf` is secret block
+        // metadata, so target builds should inspect the generated shift
+        // instructions for the SEV-SNP CPU. On the current target this is kept
+        // as a documented audit item rather than a barrel-select rewrite.
         let safe_leaf = ((leaf as usize) & (self.params.leaves - 1)) as u32;
         ct::eq_usize(self.params.node_index(depth, safe_leaf), node_idx)
     }
@@ -1473,6 +1486,9 @@ fn overlay_path_pages(
             path_pages.len()
         )));
     }
+    // The overlay map is keyed only by public ORAM page indices. Insertion
+    // order follows public batch/path/depth order returned by the store layer;
+    // secret block metadata is opaque page bytes and never chooses a key.
     let mut overlay = BTreeMap::new();
     for (path, pages) in paths.iter().zip(path_pages) {
         if path.len() != pages.len() {
@@ -1707,7 +1723,8 @@ fn read_source_block<S: TrustedBlockSource>(
 }
 
 fn random_leaf(params: &OramParams, rng: &mut (impl RngCore + CryptoRng)) -> u32 {
-    (rng.next_u64() as usize % params.leaves) as u32
+    debug_assert!(params.leaves.is_power_of_two());
+    (rng.next_u64() as usize & (params.leaves - 1)) as u32
 }
 
 #[cfg(test)]

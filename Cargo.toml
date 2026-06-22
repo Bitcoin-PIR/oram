@@ -3,7 +3,7 @@ name = "bitcoinpir-oram"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "BitcoinPIR-shaped disk-backed Path ORAM prototype"
+description = "BitcoinPIR-shaped disk-backed Circuit ORAM prototype"
 repository = "https://github.com/Bitcoin-PIR/oram"
 
 [dependencies]

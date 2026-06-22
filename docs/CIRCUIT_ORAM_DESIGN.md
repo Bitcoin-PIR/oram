@@ -4,9 +4,9 @@ This document fixes the next ORAM backend direction for BitcoinPIR: a
 disk-backed Circuit ORAM controller tuned for the existing DPF/Harmony cuckoo
 tables.
 
-The current `PathOram` implementation remains the correctness baseline.
-`CircuitOram` now provides a split metadata/payload controller prototype with
-the public deterministic scheduler. Its current eviction implementation uses
+`CircuitOram` is now the only controller in this crate. The older Path ORAM
+baseline was removed because it did not have the same trusted-memory
+side-channel hardening. The current Circuit ORAM eviction implementation uses
 two fixed metadata scans to produce a deepest-first placement plan, then applies
 the plan with one fixed payload scan. Replacing that planning routine with the
 exact optimized `deepest`/`target` circuit from the Circuit ORAM paper remains

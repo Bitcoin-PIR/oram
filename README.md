@@ -28,22 +28,23 @@ boundary, side-channel hardening rules, and current benchmark numbers.
 
 Implemented:
 
-- Path ORAM controller with in-TEE position map and stash.
-- Fixed-capacity stash slots with full-slot scans for path read/write.
+- Split metadata/payload Circuit ORAM controller with in-TEE position map and
+  fixed-capacity stash.
+- Fixed-capacity stash slots with full-slot scans for access and eviction.
 - Trusted, non-oblivious bulk initialization for offline image creation.
 - `MemPageStore` for tests.
 - `FilePageStore` for NVMe/page-file backed storage.
 - `AeadPageStore` wrapper using ChaCha20-Poly1305 per page.
 - `MerklePageStore` / `TieredMerklePageStore` wrappers that detect runtime
   rollback of disk-backed pages against trusted in-memory roots.
-- Trusted controller-state checkpoint/reopen (`OramState`), with optional
-  ChaCha20-Poly1305 state-file encryption.
+- Trusted Circuit controller-state checkpoint/reopen (`CircuitOramState`), with
+  optional ChaCha20-Poly1305 state-file encryption.
 - Fixed-prefix front cache (`FrontCachedPageStore`) for keeping public top ORAM
   tree levels in trusted memory.
 - Mask-based CMOV-style helpers for stash lookup, stash insert, position-map
   lookup/update, direct INDEX slot selection, and online target-path removal.
-- `oramctl` CLI for building deterministic test images and running random-read
-  benchmarks.
+- `oramctl` CLI for sizing, building, verifying, benchmarking, and stress
+  testing Circuit ORAM images.
 - `oramctl size-cuckoo` for estimating ORAM images over existing DPF/Harmony
   cuckoo tables.
 - `oramctl size-direct`, `build-direct`, and `bench-direct` for direct-entry
@@ -111,12 +112,15 @@ disk / untrusted storage:
   encrypted bucket pages
 ```
 
-Each access:
+Each online read:
 
 1. Reads every bucket on the old random root-to-leaf path.
-2. Moves real blocks into the stash.
+2. Removes the target block with a full path scan and inserts it into the
+   stash.
 3. Assigns the target logical block a fresh random leaf.
-4. Rewrites every bucket on the same path from the stash.
+4. Rewrites every bucket on the same path so the write set does not reveal
+   where the target was found.
+5. Drains a public number of deterministic eviction paths.
 
 The backing store sees random ORAM paths, not BitcoinPIR logical ids.
 
@@ -135,38 +139,20 @@ cargo clippy --all-targets -- -D warnings
 
 ## CLI Smoke Test
 
-Build an encrypted test image:
+Check the CLI and run the trusted position-map full-scan microbenchmark:
 
 ```bash
-KEY_HEX=4242424242424242424242424242424242424242424242424242424242424242
-STATE_KEY_HEX=7373737373737373737373737373737373737373737373737373737373737373
-
-cargo run --bin oramctl -- build \
-  --image /tmp/bpir-oram.pages \
-  --state /tmp/bpir-oram.state \
-  --state-key-hex "$STATE_KEY_HEX" \
-  --blocks 1024 \
-  --block-size 64 \
-  --encrypted \
-  --key-hex "$KEY_HEX" \
-  --cache-levels 4
+cargo run --bin oramctl -- --help
+cargo run --bin oramctl -- bench-pos-map \
+  --sizes 1024,16384 \
+  --ops 20 \
+  --warmup-ops 2 \
+  --batch-sizes 16,50
 ```
 
-Run random reads against it:
-
-```bash
-cargo run --bin oramctl -- bench \
-  --image /tmp/bpir-oram.pages \
-  --state /tmp/bpir-oram.state \
-  --state-key-hex "$STATE_KEY_HEX" \
-  --ops 1000 \
-  --encrypted \
-  --key-hex "$KEY_HEX" \
-  --cache-levels 4
-```
-
-`--cache-levels 4` caches `(1 << 4) - 1 = 15` public top-tree pages in trusted
-memory. Use `0` to disable this wrapper.
+For image-level smoke tests, use `build-circuit` / `bench-circuit` for existing
+DPF/Harmony cuckoo tables, or `build-direct` / `bench-direct` for direct
+INDEX/CHUNK source files.
 
 ## Cuckoo Table Sizing
 
