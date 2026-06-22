@@ -2573,8 +2573,8 @@ fn build_direct_table_from_source<S: TrustedBlockSource>(
         seed,
     )?;
     oram.flush()?;
-    save_circuit_state(&oram.snapshot(), &paths.state, state_key_hex)?;
     metadata.save(&paths.metadata)?;
+    let mut controller_state = oram.snapshot();
     if auth_store {
         let auth_state = build_direct_store_auth(
             paths,
@@ -2587,8 +2587,10 @@ fn build_direct_table_from_source<S: TrustedBlockSource>(
             auth_trusted_levels,
             auth_hash_page_size,
         )?;
+        controller_state = controller_state.with_auth(Some(auth_state.clone()));
         save_circuit_store_auth(&auth_state, &paths.auth_state, state_key_hex)?;
     }
+    save_circuit_state(&controller_state, &paths.state, state_key_hex)?;
     let elapsed = started.elapsed();
     let active_layout = active_auth_layout(auth_store, auth_layout);
     let meta_page_plaintext_bytes =
@@ -2722,6 +2724,7 @@ fn bench_direct_table(
     }
     validate_direct_source_for_metadata(source_file, &metadata)?;
     let loaded = load_circuit_state(&paths.state, state_key_hex)?;
+    let bound_auth = loaded.auth.clone();
     let params = loaded.params.clone();
     let cached_pages = cached_pages_for_levels(&params, cache_levels)?;
     let (meta_store, payload_store) = open_direct_file_stores_for_reopen(
@@ -2732,6 +2735,7 @@ fn bench_direct_table(
         key_hex,
         cached_pages,
         auth_store,
+        bound_auth.as_ref(),
         state_key_hex,
     )?;
     let oram = CircuitOram::from_state(meta_store, payload_store, loaded)?;
@@ -3082,7 +3086,7 @@ fn build_circuit_table(
         seed,
     )?;
     oram.flush()?;
-    save_circuit_state(&oram.snapshot(), &paths.state, state_key_hex)?;
+    let mut controller_state = oram.snapshot();
     if auth_store {
         let auth_state = build_circuit_store_auth(
             &paths,
@@ -3095,8 +3099,10 @@ fn build_circuit_table(
             auth_trusted_levels,
             auth_hash_page_size,
         )?;
+        controller_state = controller_state.with_auth(Some(auth_state.clone()));
         save_circuit_store_auth(&auth_state, &paths.auth_state, state_key_hex)?;
     }
+    save_circuit_state(&controller_state, &paths.state, state_key_hex)?;
     let elapsed = started.elapsed();
     let active_layout = active_auth_layout(auth_store, auth_layout);
     let meta_page_plaintext_bytes =
@@ -3284,6 +3290,7 @@ fn bench_circuit_table(
 ) -> Result<()> {
     let paths = circuit_output_paths(oram_dir, level);
     let loaded = load_circuit_state(&paths.state, state_key_hex)?;
+    let bound_auth = loaded.auth.clone();
     let params = loaded.params.clone();
     let cached_pages = cached_pages_for_levels(&params, cache_levels)?;
     let (meta_store, payload_store) = open_circuit_file_stores_for_reopen(
@@ -3294,6 +3301,7 @@ fn bench_circuit_table(
         key_hex,
         cached_pages,
         auth_store,
+        bound_auth.as_ref(),
         state_key_hex,
     )?;
     let mut oram = CircuitOram::from_state(meta_store, payload_store, loaded)?;
@@ -3461,6 +3469,7 @@ fn verify_circuit_bin_table(
 ) -> Result<()> {
     let paths = circuit_output_paths(oram_dir, table.level);
     let loaded = load_circuit_state(&paths.state, state_key_hex)?;
+    let bound_auth = loaded.auth.clone();
     let params = loaded.params.clone();
     let cached_pages = cached_pages_for_levels(&params, cache_levels)?;
     let (meta_store, payload_store) = open_circuit_file_stores_for_reopen(
@@ -3471,6 +3480,7 @@ fn verify_circuit_bin_table(
         key_hex,
         cached_pages,
         auth_store,
+        bound_auth.as_ref(),
         state_key_hex,
     )?;
     let oram = CircuitOram::from_state(meta_store, payload_store, loaded)?;
@@ -4710,6 +4720,7 @@ fn open_circuit_file_stores_for_reopen(
     key_hex: Option<&str>,
     cached_pages: usize,
     auth_store: bool,
+    bound_auth: Option<&CircuitStoreAuthState>,
     state_key_hex: Option<&str>,
 ) -> Result<(CircuitReopenPageStore, CircuitReopenPageStore)> {
     if !auth_store {
@@ -4729,7 +4740,10 @@ fn open_circuit_file_stores_for_reopen(
         ));
     }
 
-    let auth = load_circuit_store_auth(&paths.auth_state, state_key_hex)?;
+    let auth = match bound_auth {
+        Some(auth) => auth.clone(),
+        None => load_circuit_store_auth(&paths.auth_state, state_key_hex)?,
+    };
     match auth.layout {
         CircuitStoreAuthLayout::TieredMerkle { meta, payload } => {
             let (meta_store, payload_store) = open_circuit_file_stores(
@@ -4807,6 +4821,7 @@ fn open_direct_file_stores_for_reopen(
     key_hex: Option<&str>,
     cached_pages: usize,
     auth_store: bool,
+    bound_auth: Option<&CircuitStoreAuthState>,
     state_key_hex: Option<&str>,
 ) -> Result<(CircuitReopenPageStore, CircuitReopenPageStore)> {
     if !auth_store {
@@ -4826,7 +4841,10 @@ fn open_direct_file_stores_for_reopen(
         ));
     }
 
-    let auth = load_circuit_store_auth(&paths.auth_state, state_key_hex)?;
+    let auth = match bound_auth {
+        Some(auth) => auth.clone(),
+        None => load_circuit_store_auth(&paths.auth_state, state_key_hex)?,
+    };
     match auth.layout {
         CircuitStoreAuthLayout::TieredMerkle { meta, payload } => {
             let (meta_store, payload_store) = open_circuit_file_stores(

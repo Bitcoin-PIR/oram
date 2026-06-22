@@ -11,7 +11,7 @@ use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
-    io::{BufReader, BufWriter, Write},
+    io::{BufWriter, Write},
     path::Path,
 };
 use zeroize::Zeroize;
@@ -25,8 +25,9 @@ const STATE_NONCE_LEN: usize = 12;
 /// Trusted controller state needed to reopen a split-store Circuit ORAM image.
 ///
 /// This contains the position map, stash, RNG state, and public deterministic
-/// eviction counters. Treat it as TEE-private state; if written outside the TEE
-/// it must be encrypted or sealed.
+/// eviction counters. When authenticated stores are used, it also carries the
+/// trusted auth roots expected by the metadata and payload stores. Treat it as
+/// TEE-private state; if written outside the TEE it must be encrypted or sealed.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CircuitOramState {
     magic: [u8; 8],
@@ -39,6 +40,18 @@ pub struct CircuitOramState {
     /// Current RNG state used for future remapping.
     pub rng: ChaCha20Rng,
     /// Public deterministic Circuit ORAM eviction schedule.
+    pub schedule: CircuitEvictionSchedule,
+    /// Expected authenticated-store roots, when the image uses auth stores.
+    pub auth: Option<CircuitStoreAuthState>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LegacyCircuitOramState {
+    magic: [u8; 8],
+    pub params: OramParams,
+    pub pos_map: Vec<u32>,
+    pub stash: Vec<OramBlock>,
+    pub rng: ChaCha20Rng,
     pub schedule: CircuitEvictionSchedule,
 }
 
@@ -58,7 +71,50 @@ impl CircuitOramState {
             stash,
             rng,
             schedule,
+            auth: None,
         }
+    }
+
+    /// Attach expected authenticated-store roots to the controller state.
+    pub fn with_auth(mut self, auth: Option<CircuitStoreAuthState>) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        match bincode::deserialize::<Self>(bytes) {
+            Ok(state) => {
+                state.validate_magic()?;
+                Ok(state)
+            }
+            Err(new_err) => {
+                let legacy: LegacyCircuitOramState =
+                    bincode::deserialize(bytes).map_err(|_| Error::Bincode(new_err))?;
+                if &legacy.magic != CIRCUIT_STATE_MAGIC {
+                    return Err(Error::InvalidInput(
+                        "invalid Circuit ORAM state magic".into(),
+                    ));
+                }
+                Ok(Self {
+                    magic: legacy.magic,
+                    params: legacy.params,
+                    pos_map: legacy.pos_map,
+                    stash: legacy.stash,
+                    rng: legacy.rng,
+                    schedule: legacy.schedule,
+                    auth: None,
+                })
+            }
+        }
+    }
+
+    fn validate_magic(&self) -> Result<()> {
+        if &self.magic != CIRCUIT_STATE_MAGIC {
+            return Err(Error::InvalidInput(
+                "invalid Circuit ORAM state magic".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Persist state atomically via temp-file-and-rename.
@@ -112,15 +168,8 @@ impl CircuitOramState {
 
     /// Load a Circuit ORAM state file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let state: Self = bincode::deserialize_from(reader)?;
-        if &state.magic != CIRCUIT_STATE_MAGIC {
-            return Err(Error::InvalidInput(
-                "invalid Circuit ORAM state magic".into(),
-            ));
-        }
-        Ok(state)
+        let bytes = fs::read(path)?;
+        Self::from_bytes(&bytes)
     }
 
     /// Load an AEAD-encrypted Circuit ORAM state file.
@@ -152,13 +201,8 @@ impl CircuitOramState {
         )?;
         envelope.zeroize();
 
-        let state: Self = bincode::deserialize(&plaintext)?;
+        let state = Self::from_bytes(&plaintext)?;
         plaintext.zeroize();
-        if &state.magic != CIRCUIT_STATE_MAGIC {
-            return Err(Error::InvalidInput(
-                "invalid Circuit ORAM state magic".into(),
-            ));
-        }
         Ok(state)
     }
 }
@@ -382,6 +426,18 @@ mod tests {
         )
     }
 
+    fn sample_legacy_circuit_state() -> LegacyCircuitOramState {
+        let state = sample_circuit_state();
+        LegacyCircuitOramState {
+            magic: *CIRCUIT_STATE_MAGIC,
+            params: state.params,
+            pos_map: state.pos_map,
+            stash: state.stash,
+            rng: state.rng,
+            schedule: state.schedule,
+        }
+    }
+
     fn sample_store_auth_state() -> CircuitStoreAuthState {
         let merkle = TieredMerkleState {
             store_id: *b"bpir-idx-meta-v1",
@@ -415,6 +471,33 @@ mod tests {
         assert_eq!(loaded.params, state.params);
         assert_eq!(loaded.pos_map, state.pos_map);
         assert_eq!(loaded.schedule.pending_evictions().unwrap(), 2);
+        assert!(loaded.auth.is_none());
+    }
+
+    #[test]
+    fn encrypted_circuit_state_with_auth_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("circuit-auth-bound.state");
+        let state = sample_circuit_state().with_auth(Some(sample_embedded_store_auth_state()));
+        state.save_encrypted_atomic(&path, [7; 32]).unwrap();
+
+        let loaded = CircuitOramState::load_encrypted(&path, [7; 32]).unwrap();
+        assert_eq!(loaded.params, state.params);
+        assert_eq!(loaded.pos_map, state.pos_map);
+        assert_eq!(loaded.auth, state.auth);
+    }
+
+    #[test]
+    fn legacy_circuit_state_loads_without_auth_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-circuit.state");
+        let legacy = sample_legacy_circuit_state();
+        fs::write(&path, bincode::serialize(&legacy).unwrap()).unwrap();
+
+        let loaded = CircuitOramState::load(&path).unwrap();
+        assert_eq!(loaded.params, legacy.params);
+        assert_eq!(loaded.pos_map, legacy.pos_map);
+        assert!(loaded.auth.is_none());
     }
 
     #[test]

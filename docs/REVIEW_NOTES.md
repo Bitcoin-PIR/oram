@@ -561,12 +561,13 @@ Applied after this review:
    always-rewrite-full-path invariant for online target removal.
 5. Replaced random-leaf modulo with a power-of-two mask.
 6. Updated README/design docs so Circuit ORAM is the only controller path.
+7. Bound authenticated-store roots into `CircuitOramState`; new snapshots carry
+   the roots in trusted controller state, and CLI reopen uses those roots when
+   present.
 
 Deferred:
 
-- Binding authentication roots directly into `CircuitOramState`. The current
-  state file is bincode's positional struct encoding; appending a field would
-  break existing state-file decoding unless we introduce a versioned envelope or
-  a custom backward-compatible loader. For now the auth roots remain in
-  `*.auth.state`, and production still needs a sealed-state design that binds
-  controller state and auth state atomically.
+- Replacing the prototype compatibility path with one production sealed-state
+  envelope. The CLI still writes `*.auth.state` for old state files and external
+  tooling, but new controller snapshots also include the auth roots and verify
+  them on reopen.

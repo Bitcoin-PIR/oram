@@ -596,6 +596,7 @@ impl<M: PathPageStore, P: PathPageStore> CircuitOram<M, P> {
     pub fn from_state(meta_store: M, payload_store: P, state: CircuitOramState) -> Result<Self> {
         validate_circuit_stores(&state.params, &meta_store, &payload_store)?;
         validate_circuit_state(&state.params, &state.pos_map, &state.stash, &state.schedule)?;
+        validate_bound_auth_state(state.auth.as_ref(), &meta_store, &payload_store)?;
         let mut oram = Self {
             params: state.params,
             meta_store,
@@ -619,6 +620,7 @@ impl<M: PathPageStore, P: PathPageStore> CircuitOram<M, P> {
             self.rng.clone(),
             self.schedule.clone(),
         )
+        .with_auth(self.store_auth_state())
     }
 
     /// Immutable view of public ORAM parameters.
@@ -664,16 +666,7 @@ impl<M: PathPageStore, P: PathPageStore> CircuitOram<M, P> {
 
     /// Snapshot authenticated page-store roots, if both stores provide them.
     pub fn store_auth_state(&self) -> Option<CircuitStoreAuthState> {
-        match (
-            self.meta_store.tiered_merkle_state(),
-            self.payload_store.tiered_merkle_state(),
-        ) {
-            (Some(meta), Some(payload)) => Some(CircuitStoreAuthState::new(meta, payload)),
-            _ => Some(CircuitStoreAuthState::new_embedded(
-                self.meta_store.embedded_tree_state()?,
-                self.payload_store.embedded_tree_state()?,
-            )),
-        }
+        store_auth_state_from_stores(&self.meta_store, &self.payload_store)
     }
 
     /// Read a logical block and schedule public background eviction debt.
@@ -1639,6 +1632,43 @@ fn validate_circuit_state(
     Ok(())
 }
 
+fn store_auth_state_from_stores<M: PathPageStore, P: PathPageStore>(
+    meta_store: &M,
+    payload_store: &P,
+) -> Option<CircuitStoreAuthState> {
+    match (
+        meta_store.tiered_merkle_state(),
+        payload_store.tiered_merkle_state(),
+    ) {
+        (Some(meta), Some(payload)) => Some(CircuitStoreAuthState::new(meta, payload)),
+        _ => Some(CircuitStoreAuthState::new_embedded(
+            meta_store.embedded_tree_state()?,
+            payload_store.embedded_tree_state()?,
+        )),
+    }
+}
+
+fn validate_bound_auth_state<M: PathPageStore, P: PathPageStore>(
+    expected: Option<&CircuitStoreAuthState>,
+    meta_store: &M,
+    payload_store: &P,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = store_auth_state_from_stores(meta_store, payload_store).ok_or_else(|| {
+        Error::InvalidInput(
+            "Circuit ORAM state is bound to auth roots but stores expose no auth state".into(),
+        )
+    })?;
+    if &actual != expected {
+        return Err(Error::InvalidInput(
+            "Circuit ORAM auth roots do not match controller state".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn place_initial_meta(
     params: &OramParams,
     meta_buckets: &mut [CircuitMetaBucket],
@@ -1730,7 +1760,10 @@ fn random_leaf(params: &OramParams, rng: &mut (impl RngCore + CryptoRng)) -> u32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{store::TraceEvent, EmbeddedTreePageStore, MemPageStore, PageStore, TracingStore};
+    use crate::{
+        store::TraceEvent, CircuitStoreAuthLayout, EmbeddedTreePageStore, MemPageStore, PageStore,
+        TracingStore,
+    };
     use std::collections::{BTreeMap, BTreeSet};
 
     fn blocks(n: usize, block_size: usize) -> Vec<Vec<u8>> {
@@ -2194,6 +2227,58 @@ mod tests {
             .all(|event| matches!(event, TraceEvent::Write(_))));
 
         assert_eq!(reopened.drain_evictions(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn split_store_state_rejects_mismatched_auth_roots() {
+        let params = params(16);
+        let meta_store = MemPageStore::new(
+            params.bucket_count(),
+            circuit_meta_page_bytes(params.bucket_size),
+        )
+        .unwrap();
+        let payload_store = MemPageStore::new(
+            params.bucket_count(),
+            circuit_payload_page_bytes(params.bucket_size, params.block_size),
+        )
+        .unwrap();
+        let oram = CircuitOram::build_trusted(
+            params.clone(),
+            meta_store,
+            payload_store,
+            blocks(16, 32),
+            [34; 32],
+        )
+        .unwrap();
+        let state = oram.snapshot();
+        let (meta_store, payload_store) = oram.into_stores();
+        let embedded_meta = seal_embedded_store(
+            meta_store,
+            circuit_meta_page_bytes(params.bucket_size),
+            *b"circ-meta-bind!!",
+        );
+        let embedded_payload = seal_embedded_store(
+            payload_store,
+            circuit_payload_page_bytes(params.bucket_size, params.block_size),
+            *b"circ-data-bind!!",
+        );
+
+        let reopened = CircuitOram::from_state(embedded_meta, embedded_payload, state).unwrap();
+        let mut bad_state = reopened.snapshot();
+        match &mut bad_state
+            .auth
+            .as_mut()
+            .expect("embedded stores bind auth state")
+            .layout
+        {
+            CircuitStoreAuthLayout::EmbeddedTree { meta, .. } => meta.root_hash[0] ^= 1,
+            CircuitStoreAuthLayout::TieredMerkle { meta, .. } => meta.trusted_hashes[0][0] ^= 1,
+        }
+        let (meta_store, payload_store) = reopened.into_stores();
+
+        let err = CircuitOram::from_state(meta_store, payload_store, bad_state)
+            .expect_err("mismatched auth roots must be rejected");
+        assert!(format!("{err}").contains("auth roots do not match"));
     }
 
     #[test]
