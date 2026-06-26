@@ -68,13 +68,15 @@ Implemented:
 - Split metadata/payload `CircuitOram` controller prototype with deterministic
   delayed eviction, metadata-planned eviction placement, and fixed-shape
   page-trace tests.
-- Trusted `CircuitOramState` snapshot/reopen, including RNG state and public
-  eviction counters, with optional ChaCha20-Poly1305 state-file encryption.
+- Trusted `CircuitOramState` snapshot/reopen, including RNG state, public
+  eviction counters, and authenticated-store roots when auth is enabled, with
+  optional ChaCha20-Poly1305 state-file encryption.
 - Circuit ORAM trusted bulk initialization that plans metadata first, writes
   metadata/payload bucket pages sequentially, and uses mmap-backed cuckoo table
   reads for source payloads.
 - Sidecar and embedded-tree authentication layouts for split Circuit ORAM
-  stores, with trusted roots persisted in `*.auth.state`.
+  stores. New controller snapshots carry the trusted roots; `*.auth.state`
+  remains as a compatibility/export file for older tooling and old snapshots.
 
 Intentionally not implemented yet:
 
@@ -83,8 +85,8 @@ Intentionally not implemented yet:
   deepest-first placement, then applies that plan in one fixed payload scan.
 - Recursive position map.
 - Oblivious bulk initialization.
-- Folding authentication roots into the primary sealed production state. The
-  prototype stores them in separate `*.auth.state` files.
+- Replacing the prototype dual-file auth compatibility path with one sealed,
+  atomic production state envelope.
 - Production-serving integration for direct-entry ORAM images.
 - Crash-safe Circuit ORAM WAL / epoch protocol.
 - Target release assembly / SEV-SNP ciphertext-channel audit of all
@@ -316,12 +318,14 @@ chunk.auth.state
 
 Use `--auth-layout embedded-tree` to skip the hash images and instead append 64
 plaintext authentication bytes to every metadata/payload bucket page. In that
-layout, `*.auth.state` stores the two embedded-tree roots.
+layout, the trusted controller state stores the two embedded-tree roots;
+`*.auth.state` is still written for compatibility and external tooling.
 
 Use the same `--auth-store` flag when reopening with `bench-circuit` or
-`verify-circuit-bins`; the CLI then loads the auth layout and trusted roots from
-`*.auth.state`, verifies data pages against them, and writes updated roots back
-unless `--no-save` is set.
+`verify-circuit-bins`; the CLI then prefers auth roots bound inside the
+controller state, falls back to `*.auth.state` for legacy snapshots, verifies
+data pages against those roots, and writes updated roots back unless
+`--no-save` is set.
 
 For native batch callers, `CircuitOram::read_batch` performs the online phase
 for several logical ids through one path-page batch. Direct readers expose that

@@ -126,7 +126,9 @@ steady-state request IO path.
 `oramctl build-circuit --auth-store` still defaults to per-level
 metadata/payload hash images plus an auth-state sidecar for the existing
 baseline. `--auth-layout embedded-tree` builds physical bucket pages with the
-64-byte embedded trailer and persists the embedded roots in `*.auth.state`.
+64-byte embedded trailer. New controller snapshots carry the embedded roots;
+`*.auth.state` remains a compatibility/export file for older tooling and old
+snapshots.
 `EmbeddedTreePageStore` is the path-level store for this format: it builds
 embedded child hashes, verifies `read_path`, updates hashes on `write_path`, and
 has trace tests showing a verified read followed by a write touches only the path
@@ -292,7 +294,8 @@ eviction to cross a durable boundary.
    levels while spilling lower hash nodes to sidecar images, and
    `EmbeddedTreePageStore` stores child hashes inside physical bucket pages.
    `oramctl build-circuit --auth-store --auth-layout embedded-tree` and
-   `bench-circuit --auth-store` build, reopen, verify, and save updated roots.
+   `bench-circuit --auth-store` build, reopen, verify, and save updated roots in
+   controller state, with `*.auth.state` retained for compatibility.
 7. Add native online batch reads.
    Done at the library boundary: `PathPageStore` supports multi-path reads and
    writes, `CircuitOram::read_batch` batches the online phase, and direct readers
